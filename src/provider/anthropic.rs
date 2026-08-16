@@ -13,8 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::ProviderError;
 
 use super::{
-    Delta, Provider, ProviderSpec, Request, Role, approximate_token_count, send_with_retry,
-    with_cancellation,
+    Delta, Provider, ProviderSpec, Request, Role, count_tokens, send_with_retry, with_cancellation,
 };
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -91,7 +90,7 @@ impl Provider for AnthropicProvider {
     }
 
     fn count_tokens(&self, text: &str) -> u32 {
-        approximate_token_count(text)
+        count_tokens(text)
     }
 
     async fn stream(

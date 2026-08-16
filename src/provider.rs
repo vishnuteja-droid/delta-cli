@@ -1,13 +1,7 @@
 //! LLM provider abstraction: async streaming completions, retry with
 //! backoff, and mid-flight cancellation, with `OpenAiCompatible` and
 //! `Anthropic` implementations declared in `config.rs` and constructed
-//! here via [`load`].
-//!
-//! Nothing in `cli.rs` calls into this module yet — `dlt run <stage>`
-//! (the first caller) arrives in prompt 3 — so the whole tree is
-//! allowed dead code until then; it's fully implemented and tested via
-//! `cargo test`, just not wired up.
-#![allow(dead_code)]
+//! here via [`load`]. Driven by `dlt run <stage>` in `cli.rs`.
 
 pub mod anthropic;
 pub mod openai_compatible;
@@ -40,6 +34,10 @@ pub struct Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     User,
+    /// Not yet constructed anywhere: `dlt run` only ever sends a single
+    /// user turn per stage. Kept so `Message`/`Role` don't need a
+    /// breaking shape change once multi-turn conversation history exists.
+    #[allow(dead_code)]
     Assistant,
 }
 
@@ -152,6 +150,49 @@ pub fn load(config: &Config, name: &str) -> Result<AnyProvider, ProviderError> {
     }
 }
 
+/// A provider stand-in for `dlt run --dry-run`: exposes only
+/// `context_window`/`count_tokens` (both derivable from config alone) so
+/// prompt assembly can be debugged without live credentials — `--dry-run`
+/// must work even when no `api_key_env` is set. `stream` is never called
+/// on it; `dlt run` without `--dry-run` uses [`load`] instead.
+#[derive(Debug)]
+pub struct DryRunProvider {
+    name: String,
+    context_window: u32,
+}
+
+impl Provider for DryRunProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn context_window(&self) -> u32 {
+        self.context_window
+    }
+
+    fn count_tokens(&self, text: &str) -> u32 {
+        count_tokens(text)
+    }
+
+    async fn stream(
+        &self,
+        _request: Request,
+        _cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError> {
+        unreachable!("DryRunProvider is only used for --dry-run prompt assembly, never streamed")
+    }
+}
+
+/// Load just enough of `[providers.<name>]` to budget a prompt: no
+/// `api_key_env` lookup, so this succeeds even without credentials.
+pub fn load_for_dry_run(config: &Config, name: &str) -> Result<DryRunProvider, ProviderError> {
+    let spec = load_spec(config, name)?;
+    Ok(DryRunProvider {
+        name: name.to_string(),
+        context_window: spec.context_window,
+    })
+}
+
 fn load_spec(config: &Config, name: &str) -> Result<ProviderSpec, ProviderError> {
     let prefix = format!("providers.{name}");
     if config.get(&prefix).is_none() {
@@ -197,12 +238,33 @@ fn load_spec(config: &Config, name: &str) -> Result<ProviderSpec, ProviderError>
     })
 }
 
-/// SHA-256-free token approximation: ~4 chars/token is the commonly
-/// cited rule of thumb for English text. Replaced by real tokenization
-/// in prompt 3.
+/// Chars/4 token approximation: the commonly cited rule of thumb for
+/// English text. Used only as a fallback if the bundled `cl100k_base`
+/// vocab somehow fails to load — `count_tokens` is the real API.
 fn approximate_token_count(text: &str) -> u32 {
     let chars = text.chars().count() as u32;
     chars.div_ceil(4).max(if text.is_empty() { 0 } else { 1 })
+}
+
+/// The `cl100k_base` BPE, built once from its bundled (not
+/// network-fetched) vocab data. `cl100k_base()` returns a `Result` only
+/// because the crate's API is generic over loading failures; with the
+/// vocab compiled in via `include_str!` it cannot actually fail here, so
+/// this treats it as fallible anyway (`unwrap`/`expect` are denied
+/// crate-wide) and falls back to the chars/4 heuristic rather than panic.
+fn bpe() -> Option<&'static tiktoken_rs::CoreBPE> {
+    static BPE: std::sync::OnceLock<Option<tiktoken_rs::CoreBPE>> = std::sync::OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::cl100k_base().ok()).as_ref()
+}
+
+/// Real BPE token count via `cl100k_base`, the vocab OpenAI- and
+/// Anthropic-compatible endpoints both roughly track closely enough for
+/// context-budget purposes.
+fn count_tokens(text: &str) -> u32 {
+    match bpe() {
+        Some(bpe) => bpe.encode_ordinary(text).len() as u32,
+        None => approximate_token_count(text),
+    }
 }
 
 /// Read `Retry-After` as a whole number of seconds. HTTP also allows an
@@ -301,6 +363,17 @@ mod tests {
         assert_eq!(approximate_token_count("abcd"), 1);
         assert_eq!(approximate_token_count("abcde"), 2);
         assert_eq!(approximate_token_count(&"a".repeat(400)), 100);
+    }
+
+    #[test]
+    fn count_tokens_uses_real_bpe() {
+        assert_eq!(count_tokens(""), 0);
+        // Real BPE tokens roughly track words, not chars/4 — a repeated
+        // single character compresses far below the chars/4 estimate,
+        // which is the property that matters for budgeting: real counts
+        // and the heuristic must not be interchangeable.
+        let text = "a".repeat(400);
+        assert!(count_tokens(&text) < approximate_token_count(&text));
     }
 
     #[test]

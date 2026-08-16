@@ -1,0 +1,17 @@
+id: tasks
+name: Task Breakdown
+inputs: [proposal, design]
+min_rigor: standard
+template: |
+  {{ agents_md }}
+  ## Proposal
+  {{ inputs.proposal.body }}
+  ## Design
+  {{ inputs.design.body }}
+  Break the design into a checklist of concrete implementation tasks.
+output:
+  required_sections: [Tasks]
+  validators:
+    - non_empty_sections
+    - no_placeholder_text
+    - min_words: 30

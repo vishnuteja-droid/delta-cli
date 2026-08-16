@@ -1,0 +1,17 @@
+id: design
+name: Technical Design
+inputs: [proposal]
+min_rigor: standard
+template: |
+  {{ agents_md }}
+  ## Current truth
+  {{ truth.relevant }}
+  ## Proposal
+  {{ inputs.proposal.body }}
+  Produce a technical design covering interfaces, data, and risks.
+output:
+  required_sections: [Interfaces, Data, Risks, Alternatives Considered]
+  validators:
+    - non_empty_sections
+    - no_placeholder_text
+    - min_words: 200

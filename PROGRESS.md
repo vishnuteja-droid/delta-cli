@@ -296,3 +296,136 @@ prompt 2's scope but a real bug):**
   both pre-flight in `send_with_retry` and mid-flight via `with_cancellation`) — prompt 6's `esc
   to interrupt` (or prompt 3's own interrupt handling, if it needs any before the TUI exists)
   can create one, pass it down, and call `.cancel()` from wherever the interrupt signal lands.
+
+## Session 3 — Prompt 3 (stage machine)
+
+**Shipped:**
+
+- `stages/{proposal,design,tasks}.yaml` at the repo root: compile-time-embedded (`include_str!`)
+  seed content. `Workspace::init` copies them out to `.delta/stages/*.yaml` on disk; from then
+  on `stage::load_all` reads exclusively from `.delta/stages/`, so editing or adding a stage
+  file post-init never requires a recompile, per the prompt's explicit requirement. `design.yaml`
+  is copied verbatim from `PLAN.md`'s literal example; `proposal.yaml`/`tasks.yaml` were designed
+  to fit the same schema and preserve prompt 1's proposal→design→tasks shape (no stage YAML for
+  those two is given in the plan text).
+- `stage.rs` (module root): `Rigor` (`Trivial < Standard < Deep`, derived `Ord`, `FromStr`/
+  `Display`, no `clap` dependency — `cli.rs`'s derive picks it up via `FromStr` automatically,
+  keeping stage.rs's module boundary clean), `StageDefinition`/`OutputSpec`/`Validator`
+  (`NonEmptySections`/`NoPlaceholderText`/`MinWords(usize)`), two-phase YAML parsing (private
+  `RawStageDefinition`/`ValidatorSpec` with `#[serde(untagged)]` resolving both the bare-string
+  and single-key-map validator shapes), `load_all` (lists+parses `.delta/stages/*.{yaml,yml}`),
+  and `topological_order` — Kahn's algorithm with explicit checks for duplicate ids, dangling
+  input references, zero/multiple root stages, and cycles (all via `StageError::InvalidGraph`,
+  never a panic).
+- `stage/classify.rs`: `classify(repo_root) -> Rigor` from `git diff HEAD` — counts files
+  touched (`diff --git` lines) and scans added lines for public-interface markers (`pub fn`,
+  `export function`, `def `, etc. across Rust/JS/Python). Thresholds: any interface change or
+  >10 files touched → Deep; >1 file → Standard; else Trivial. Falls back to `Rigor::Trivial`
+  (never blocks, never panics) if git is unavailable or the repo doesn't exist.
+- `stage/validate.rs`: `validate(output, body) -> Vec<String>` — heading-based section
+  extraction (a section's content runs until the next heading at the same or shallower level;
+  deeper subheadings and plain text both count as content) for `non_empty_sections`,
+  case-insensitive substring scan (TODO/TBD/Lorem ipsum/XXX/FIXME) for `no_placeholder_text`,
+  whitespace word count for `min_words`.
+- `stage/context.rs`: `assemble(store, repo_root, stage, slug, provider) -> Assembled` —
+  `AGENTS.md` read directly via `std::fs` (outside `.delta/`, so not through `Store`),
+  `.delta/truth/*.md` concatenated under per-file headings, a `walkdir`-based repo tree summary
+  (`.sort_by_file_name()` for determinism, `NOISE_DIRS` skips `.git`/`.delta`/`target`/
+  `node_modules`/`dist`/`build`, capped at 500 entries), declared `inputs` resolved via
+  `change::read_artifact_body` (errors `StageError::MissingInput` if an input hasn't been
+  generated yet — "run `dlt run <input>` first"), rendered through MiniJinja
+  (`Environment::render_str` + the `context!` macro + `Value::from_serialize` for the inputs
+  map — verified against the actual 2.24.0 source before writing any code, not guessed).
+  Token budget = `provider.context_window()` minus a 4096-token reserve for the model's own
+  output; over budget, drops **repo_tree**, then **truth.relevant**, then **agents_md**, in that
+  order (declared `inputs` are never dropped), re-rendering and re-counting after each drop,
+  recording what got dropped in `Assembled.dropped`. `insta` snapshot test
+  (`snapshot_of_assembled_design_prompt`) pins the literal rendered output of a design-stage
+  prompt end to end.
+- `provider.rs`: real BPE token counting via `tiktoken-rs`'s bundled (not network-fetched)
+  `cl100k_base` vocab, behind a `OnceLock<Option<CoreBPE>>` that falls back to the old chars/4
+  heuristic rather than `unwrap()`/`expect()` on `cl100k_base()`'s technically-fallible `Result`
+  (it can't actually fail with the vocab compiled in via `include_str!`, but the crate-wide
+  `unwrap_used`/`expect_used` ban doesn't care). Added `DryRunProvider` + `load_for_dry_run`: a
+  provider stand-in exposing only `context_window`/`count_tokens` (both derivable from config
+  alone, no `api_key_env` lookup) so `dlt run --dry-run` works with **zero live credentials** —
+  a deliberate elaboration on the plan's "prints the assembled prompt without calling
+  anything... this is how you debug context assembly forever," since requiring a real API key
+  just to preview a prompt would undercut that. Removed the module's `#![allow(dead_code)]` now
+  that `cli.rs` is the real caller.
+- `change.rs`: replaced `ArtifactKind` entirely with generic `stage_id: &str` +
+  `stages: &[StageDefinition]` parameters threaded through `new_change`, `change_status`,
+  `archive_change`, `stale_artifacts`, `recompute_hash`; `ChangeStatus.stage` is now an owned
+  `String` (was `&'static str`, impossible now that stage ids come from loaded YAML).
+  `Frontmatter` gained `rigor: Option<Rigor>` (`#[serde(default)]`, backward-compatible with
+  pre-prompt-3 artifacts — missing/unknown rigor defaults to `Rigor::Deep`, the safe "never
+  silently skip" fallback, via the new `change_rigor` helper). `ArtifactStatus` gained
+  `NotApplicable` (serialized as `"n/a"`), which `change_status`/`stale_artifacts` both treat as
+  a terminal, never-stale state — a stage deliberately skipped for rigor reasons doesn't get
+  re-flagged just because its (irrelevant) stored hash drifts. New `read_artifact_body` (used by
+  both `recompute_hash` and `stage::context::assemble`) and `write_stage_artifact` (used by
+  `cli.rs`'s `cmd_run`; takes a `StageWrite` struct rather than 5 loose params to stay under
+  clippy's `too_many_arguments`) — preserves an artifact's original `created` timestamp across
+  reruns, always recomputes `source_hash` fresh from current input bodies.
+- `cli.rs`: `Command::Run(RunArgs)` — `dlt run <stage> --change <slug> [--dry-run]
+  [--provider NAME] [--rigor R]`. `--change` is a deliberate elaboration: `PLAN.md`'s literal
+  `dlt run <stage>` doesn't say which change, and a stage run has to target one. Rigor
+  resolution: `--rigor` override wins, else `change::change_rigor` (the value recorded at
+  `change new` time). If `stage.min_rigor > effective_rigor`, writes an `n/a` artifact and
+  prints a skip message — **returns `Ok(())`, not an error** — per "skipped... not failed."
+  Otherwise assembles context, prints what (if anything) got dropped and the final token count
+  to stderr, and either prints the prompt (`--dry-run`) or spins up a fresh
+  `tokio::runtime::Runtime` (`main.rs` stays fully synchronous; only this command pays tokio
+  startup cost) to stream the completion to stdout as it arrives, validates the result, and
+  writes the artifact as `Valid` or `Failed`. A validation failure returns
+  `StageError::ValidationFailed`, mapped to **exit code 3** — the first real trigger for "gate
+  not satisfied" in the whole project; every other `StageError`/most `ProviderError` variants
+  map to 2, `Provider::{Request,Http,MalformedStream,Cancelled}` and the new `CliError::Runtime`
+  map to 1. `ChangeCommand::New` gained `--rigor` (override) with the same "always allow to force
+  the full path" semantics; without an override it calls `stage::classify::classify`.
+
+**Verified:**
+
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo test` — 59 passing (52 unit including 21 new across `stage`/`stage::classify`/
+  `stage::context`/`stage::validate`/`change`/`provider`, plus the `insta` snapshot; 7
+  `tests/cli.rs` integration, unchanged from prompt 1). Confirmed green under both
+  `--test-threads=1` and default parallelism, no flakes.
+- `cargo fmt --check` clean.
+- Manual end-to-end smoke test of the built binary in a scratch git repo: `dlt init` → `dlt
+  change new my-feature --rigor deep` → `dlt status` (shows `pending`) → wrote a
+  `[providers.default]` config block → `dlt run proposal --change my-feature --dry-run` (prints
+  the assembled prompt, no API key set, works as designed) → `dlt run design --change
+  my-feature --dry-run` (pulls in the placeholder proposal body as `{{ inputs.proposal.body }}`)
+  → `dlt change new tiny-fix --rigor trivial` → `dlt run design --change tiny-fix --dry-run`
+  (writes an `n/a` artifact, prints the skip message, exit 0, confirmed via `dlt status`) → `dlt
+  run tasks --change my-feature --dry-run` before design ran (fails with `StageError::
+  MissingInput`, exit 2, points at `dlt run design`) → `dlt run bogus-stage ... ` (fails with
+  `StageError::NotFound`, exit 2). All behaved as designed.
+- Re-confirmed no C dependencies crept in: `minijinja`/`walkdir`/`tiktoken-rs` (real deps) and
+  `insta` (dev-only, doesn't affect the release binary) all resolve to pure-Rust dependency
+  trees — `cargo tree --edges normal` shows only the pre-existing plain `libc` bindings crate,
+  no new `-sys` crates, no `openssl`/`aws-lc`/`native-tls`.
+
+**What prompt 4 should assume:**
+
+- `stage::load_all(store) -> Result<Vec<StageDefinition>, StageError>` returns stages in
+  topological order (root first); `change_status`/`stale_artifacts` rely on that ordering rather
+  than re-sorting themselves — don't reorder the returned `Vec` without updating those call
+  sites.
+- `ArtifactStatus::NotApplicable` exists and is load-bearing: it's the only status
+  `change_status`/`stale_artifacts` treat as permanently non-stale. Verification (prompt 4)
+  should likely skip `n/a` artifacts the same way `dlt run`'s rigor gate does, rather than
+  trying to verify a stage that was deliberately never generated.
+- `dlt run`'s validation step (`stage::validate::validate`) is purely textual (required
+  sections present/non-empty, no placeholder markers, minimum word count) — it does **not**
+  execute anything. Prompt 4's "executable verification" is a distinct, additional gate on top
+  of this, not a replacement for it; both can fail independently and should probably both be
+  checked before a stage counts as `Valid`.
+- `DryRunProvider`/`provider::load_for_dry_run` exist specifically so prompt-assembly debugging
+  never needs live credentials — if prompt 4 adds its own "preview without calling anything"
+  path, prefer extending this rather than inventing a second no-credentials provider path.
+- No `CliError`/exit-code mapping exists yet for whatever prompt 4's verification engine
+  produces (`VerifyError` is still the prompt-0 `Unimplemented` stub) — exit code 3 is now
+  precedented (validation-failure shape), but prompt 4 should decide for itself whether
+  verification failures reuse it or need their own code.

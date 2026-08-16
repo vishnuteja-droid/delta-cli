@@ -46,41 +46,34 @@ pub enum ChangeError {
     InvalidSlug { slug: String },
     #[error("change {slug} has stale artifacts and cannot be archived: {artifacts}")]
     Stale { slug: String, artifacts: String },
+    #[error("stage {id:?} is not among the loaded stage definitions")]
+    UnknownStage { id: String },
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
 }
 
-/// Top-level error for CLI dispatch. Its only job beyond wrapping the
-/// per-module errors is mapping each to the exit code CI depends on:
-/// 0 ok, 1 internal, 2 validation failed, 3 gate not satisfied, 4 stale inputs.
+/// Runtime-loaded stage definitions (YAML), rigor gating, and the
+/// prompt-assembly/output-validation pipeline `dlt run` drives.
 #[derive(Debug, Error)]
-pub enum CliError {
-    #[error(transparent)]
-    Config(#[from] ConfigError),
+pub enum StageError {
+    #[error("no stage named {id:?} (looked in .delta/stages/)")]
+    NotFound { id: String },
+    #[error("failed to load stage definition {path}: {reason}")]
+    Load { path: String, reason: String },
+    #[error("invalid stage graph: {reason}")]
+    InvalidGraph { reason: String },
+    #[error("stage {id:?} output failed validation: {failures}")]
+    ValidationFailed { id: String, failures: String },
+    #[error("failed to render stage {id:?}'s template: {reason}")]
+    Render { id: String, reason: String },
+    #[error(
+        "stage {stage:?} declares input {input:?}, but it hasn't been generated yet — run `dlt run {input}` first"
+    )]
+    MissingInput { stage: String, input: String },
     #[error(transparent)]
     Workspace(#[from] WorkspaceError),
     #[error(transparent)]
     Change(#[from] ChangeError),
-}
-
-impl CliError {
-    pub fn exit_code(&self) -> u8 {
-        match self {
-            CliError::Config(_) => 1,
-            CliError::Workspace(WorkspaceError::Io { .. }) => 1,
-            CliError::Workspace(_) => 2,
-            CliError::Change(ChangeError::Workspace(WorkspaceError::Io { .. })) => 1,
-            CliError::Change(ChangeError::Stale { .. }) => 4,
-            CliError::Change(_) => 2,
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-#[allow(dead_code)] // constructed once stage.rs gains real logic in prompt 3
-pub enum StageError {
-    #[error("stage machine not yet implemented")]
-    Unimplemented,
 }
 
 #[derive(Debug, Error)]
@@ -109,6 +102,56 @@ pub enum ProviderError {
     MalformedStream { name: String, reason: String },
     #[error("request to provider {name:?} was cancelled")]
     Cancelled { name: String },
+}
+
+/// Top-level error for CLI dispatch. Its only job beyond wrapping the
+/// per-module errors is mapping each to the exit code CI depends on:
+/// 0 ok, 1 internal, 2 validation failed, 3 gate not satisfied, 4 stale inputs.
+#[derive(Debug, Error)]
+pub enum CliError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
+    #[error(transparent)]
+    Stage(#[from] StageError),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error("failed to start async runtime: {0}")]
+    Runtime(#[from] std::io::Error),
+}
+
+impl CliError {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            CliError::Config(_) => 1,
+            CliError::Workspace(WorkspaceError::Io { .. }) => 1,
+            CliError::Workspace(_) => 2,
+            CliError::Change(err) => change_exit_code(err),
+            CliError::Stage(StageError::ValidationFailed { .. }) => 3,
+            CliError::Stage(StageError::Workspace(WorkspaceError::Io { .. })) => 1,
+            CliError::Stage(StageError::Change(err)) => change_exit_code(err),
+            CliError::Stage(_) => 2,
+            CliError::Provider(
+                ProviderError::Request { .. }
+                | ProviderError::Http { .. }
+                | ProviderError::MalformedStream { .. }
+                | ProviderError::Cancelled { .. },
+            ) => 1,
+            CliError::Provider(_) => 2,
+            CliError::Runtime(_) => 1,
+        }
+    }
+}
+
+fn change_exit_code(err: &ChangeError) -> u8 {
+    match err {
+        ChangeError::Workspace(WorkspaceError::Io { .. }) => 1,
+        ChangeError::Stale { .. } => 4,
+        _ => 2,
+    }
 }
 
 #[derive(Debug, Error)]

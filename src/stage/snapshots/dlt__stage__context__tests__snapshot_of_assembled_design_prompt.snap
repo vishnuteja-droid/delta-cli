@@ -1,0 +1,16 @@
+---
+source: src/stage/context.rs
+expression: assembled.prompt
+---
+Follow the house style.
+
+## Current truth
+### overview.md
+The system has one module.
+
+## Proposal
+# Proposal
+
+Add a health check endpoint.
+
+Produce a technical design.

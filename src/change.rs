@@ -1,7 +1,10 @@
 //! The artifact and change model: markdown-with-YAML-frontmatter
 //! artifacts, `source_hash` computation and staleness detection, and the
 //! change lifecycle (new, list, archive — applying deltas to truth).
-//! Does not talk to a provider or perform verification.
+//! Stages are runtime-loaded (`stage.rs`); this module never hardcodes
+//! which stages exist, only how a change's artifacts relate to whatever
+//! stage graph it's given. Does not talk to a provider or perform
+//! verification.
 
 use std::path::{Path, PathBuf};
 
@@ -10,51 +13,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::ChangeError;
+use crate::stage::{Rigor, StageDefinition};
 use crate::workspace::{ARCHIVE_DIR, CHANGES_DIR, Store, TRUTH_DIR};
-
-const PROPOSAL_PLACEHOLDER: &str = "# Proposal\n\nTODO: describe the change.\n";
-
-/// The three artifacts a change can hold, in dependency order. Each
-/// stage's declared inputs are fixed for now (there's no runtime stage
-/// graph yet — that arrives in prompt 3 and will drive this instead).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArtifactKind {
-    Proposal,
-    Design,
-    Tasks,
-}
-
-impl ArtifactKind {
-    pub const ORDER: [ArtifactKind; 3] = [
-        ArtifactKind::Proposal,
-        ArtifactKind::Design,
-        ArtifactKind::Tasks,
-    ];
-
-    pub fn id(self) -> &'static str {
-        match self {
-            ArtifactKind::Proposal => "proposal",
-            ArtifactKind::Design => "design",
-            ArtifactKind::Tasks => "tasks",
-        }
-    }
-
-    fn filename(self) -> &'static str {
-        match self {
-            ArtifactKind::Proposal => "proposal.md",
-            ArtifactKind::Design => "design.md",
-            ArtifactKind::Tasks => "tasks.md",
-        }
-    }
-
-    fn inputs(self) -> &'static [ArtifactKind] {
-        match self {
-            ArtifactKind::Proposal => &[],
-            ArtifactKind::Design => &[ArtifactKind::Proposal],
-            ArtifactKind::Tasks => &[ArtifactKind::Proposal, ArtifactKind::Design],
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,6 +23,10 @@ pub enum ArtifactStatus {
     Valid,
     Stale,
     Failed,
+    /// Skipped because the stage's `min_rigor` exceeded the change's
+    /// rigor — not a failure, just not applicable to this change.
+    #[serde(rename = "n/a")]
+    NotApplicable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +36,12 @@ pub struct Frontmatter {
     pub updated: DateTime<Utc>,
     pub source_hash: String,
     pub status: ArtifactStatus,
+    /// The change's rigor, recorded on its root artifact at `change new`
+    /// time (or overridden per-run). `None` on artifacts written before
+    /// this field existed; treated as `Rigor::Deep` — never silently
+    /// skip a stage for a change we can't classify.
+    #[serde(default)]
+    pub rigor: Option<Rigor>,
 }
 
 /// An artifact: YAML frontmatter plus a markdown body.
@@ -154,34 +124,81 @@ fn deltas_dir(slug: &str) -> PathBuf {
     change_dir(slug).join("deltas")
 }
 
-fn artifact_path(slug: &str, kind: ArtifactKind) -> PathBuf {
-    change_dir(slug).join(kind.filename())
+fn artifact_path(slug: &str, stage_id: &str) -> PathBuf {
+    change_dir(slug).join(format!("{stage_id}.md"))
 }
 
-/// Create a change: `changes/<slug>/deltas/` plus a placeholder `proposal.md`.
-pub fn new_change(store: &dyn Store, slug: &str, now: DateTime<Utc>) -> Result<(), ChangeError> {
+fn find_root(stages: &[StageDefinition]) -> Result<&StageDefinition, ChangeError> {
+    stages
+        .iter()
+        .find(|s| s.inputs.is_empty())
+        .ok_or_else(|| ChangeError::UnknownStage {
+            id: "<root stage>".to_string(),
+        })
+}
+
+fn find_stage<'a>(
+    stages: &'a [StageDefinition],
+    id: &str,
+) -> Result<&'a StageDefinition, ChangeError> {
+    stages
+        .iter()
+        .find(|s| s.id == id)
+        .ok_or_else(|| ChangeError::UnknownStage { id: id.to_string() })
+}
+
+fn placeholder_body(stage: &StageDefinition) -> String {
+    format!("# {}\n\nTODO: describe the change.\n", stage.name)
+}
+
+/// Read a change's artifact body for `stage_id`, if it exists yet.
+/// `Ok(None)` means the stage simply hasn't been run — not an error.
+pub(crate) fn read_artifact_body(
+    store: &dyn Store,
+    slug: &str,
+    stage_id: &str,
+) -> Result<Option<String>, ChangeError> {
+    let path = artifact_path(slug, stage_id);
+    if !store.exists(&path) {
+        return Ok(None);
+    }
+    let text = store.read_to_string(&path)?;
+    Ok(Some(
+        Artifact::parse(&path.display().to_string(), &text)?.body,
+    ))
+}
+
+/// Create a change: `changes/<slug>/deltas/` plus a placeholder artifact
+/// for the stage graph's root stage (the one with no declared inputs),
+/// recording `rigor` on it for later stages to read via `change_rigor`.
+pub fn new_change(
+    store: &dyn Store,
+    slug: &str,
+    now: DateTime<Utc>,
+    stages: &[StageDefinition],
+    rigor: Rigor,
+) -> Result<(), ChangeError> {
     validate_slug(slug)?;
     if store.exists(&change_dir(slug)) {
         return Err(ChangeError::AlreadyExists {
             slug: slug.to_string(),
         });
     }
+    let root = find_root(stages)?;
     store.create_dir_all(&deltas_dir(slug))?;
 
     let artifact = Artifact {
         frontmatter: Frontmatter {
-            stage: ArtifactKind::Proposal.id().to_string(),
+            stage: root.id.clone(),
             created: now,
             updated: now,
             source_hash: source_hash(&[]),
             status: ArtifactStatus::Pending,
+            rigor: Some(rigor),
         },
-        body: PROPOSAL_PLACEHOLDER.to_string(),
+        body: placeholder_body(root),
     };
-    store.write_string(
-        &artifact_path(slug, ArtifactKind::Proposal),
-        &artifact.render()?,
-    )?;
+    store.write_string(&artifact_path(slug, &root.id), &artifact.render()?)?;
     Ok(())
 }
 
@@ -189,45 +206,107 @@ pub fn list_changes(store: &dyn Store) -> Result<Vec<String>, ChangeError> {
     Ok(store.list_dir(Path::new(CHANGES_DIR))?)
 }
 
+/// A change's rigor, as recorded on its root artifact at `change new`
+/// time. Defaults to `Rigor::Deep` if the change or its rigor field is
+/// missing — the safe fallback that never causes a stage to be skipped
+/// for data we can't classify.
+pub fn change_rigor(
+    store: &dyn Store,
+    stages: &[StageDefinition],
+    slug: &str,
+) -> Result<Rigor, ChangeError> {
+    let root = find_root(stages)?;
+    let path = artifact_path(slug, &root.id);
+    if !store.exists(&path) {
+        return Ok(Rigor::Deep);
+    }
+    let text = store.read_to_string(&path)?;
+    let artifact = Artifact::parse(&path.display().to_string(), &text)?;
+    Ok(artifact.frontmatter.rigor.unwrap_or(Rigor::Deep))
+}
+
+/// The fields `write_stage_artifact` needs beyond `store`/`stages`/`slug`,
+/// grouped so the function doesn't grow an unwieldy argument list.
+pub struct StageWrite<'a> {
+    pub stage_id: &'a str,
+    pub body: &'a str,
+    pub status: ArtifactStatus,
+    pub rigor: Option<Rigor>,
+    pub now: DateTime<Utc>,
+}
+
+/// Write (or overwrite) a stage's artifact for a change: computes its
+/// `source_hash` fresh from its declared inputs' current bodies,
+/// preserves the artifact's original `created` timestamp across reruns
+/// if one already exists, and stamps `updated` as `write.now`.
+pub fn write_stage_artifact(
+    store: &dyn Store,
+    stages: &[StageDefinition],
+    slug: &str,
+    write: StageWrite<'_>,
+) -> Result<(), ChangeError> {
+    let path = artifact_path(slug, write.stage_id);
+    let created = if store.exists(&path) {
+        let text = store.read_to_string(&path)?;
+        Artifact::parse(&path.display().to_string(), &text)?
+            .frontmatter
+            .created
+    } else {
+        write.now
+    };
+    let source_hash = recompute_hash(store, slug, stages, write.stage_id)?;
+    let artifact = Artifact {
+        frontmatter: Frontmatter {
+            stage: write.stage_id.to_string(),
+            created,
+            updated: write.now,
+            source_hash,
+            status: write.status,
+            rigor: write.rigor,
+        },
+        body: write.body.to_string(),
+    };
+    store.write_string(&path, &artifact.render()?)?;
+    Ok(())
+}
+
 pub struct ChangeStatus {
     pub slug: String,
-    pub stage: &'static str,
+    pub stage: String,
     pub state: ArtifactStatus,
     pub age: chrono::Duration,
 }
 
-/// Recompute what `kind`'s source_hash *should* be right now, from the
-/// current bodies of its declared inputs. A missing input contributes an
-/// empty body rather than erroring — the recomputed hash then simply
-/// won't match, correctly reporting staleness.
+/// Recompute what `stage_id`'s source_hash *should* be right now, from
+/// the current bodies of its declared inputs. A missing input
+/// contributes an empty body rather than erroring — the recomputed hash
+/// then simply won't match, correctly reporting staleness.
 fn recompute_hash(
     store: &dyn Store,
     slug: &str,
-    kind: ArtifactKind,
+    stages: &[StageDefinition],
+    stage_id: &str,
 ) -> Result<String, ChangeError> {
-    let mut bodies = Vec::new();
-    for input in kind.inputs() {
-        let path = artifact_path(slug, *input);
-        let body = if store.exists(&path) {
-            let text = store.read_to_string(&path)?;
-            Artifact::parse(&path.display().to_string(), &text)?.body
-        } else {
-            String::new()
-        };
-        bodies.push(body);
+    let stage = find_stage(stages, stage_id)?;
+    let mut bodies = Vec::with_capacity(stage.inputs.len());
+    for input in &stage.inputs {
+        bodies.push(read_artifact_body(store, slug, input)?.unwrap_or_default());
     }
     let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
     Ok(source_hash(&refs))
 }
 
-/// Status of the furthest artifact that exists for a change (proposal <
-/// design < tasks). `state` reflects staleness first: if the artifact's
-/// stored `source_hash` no longer matches its inputs' current bodies, it
-/// is `Stale` regardless of what its frontmatter says.
+/// Status of the furthest artifact that exists for a change, per
+/// `stages`' topological order. `state` reflects staleness first: if the
+/// artifact's stored `source_hash` no longer matches its inputs' current
+/// bodies, it is `Stale` regardless of what its frontmatter says — except
+/// `NotApplicable` artifacts, which were deliberately skipped and are
+/// never reported stale.
 pub fn change_status(
     store: &dyn Store,
     slug: &str,
     now: DateTime<Utc>,
+    stages: &[StageDefinition],
 ) -> Result<ChangeStatus, ChangeError> {
     if !store.exists(&change_dir(slug)) {
         return Err(ChangeError::NotFound {
@@ -235,51 +314,64 @@ pub fn change_status(
         });
     }
 
-    let furthest = ArtifactKind::ORDER
-        .into_iter()
-        .rfind(|kind| store.exists(&artifact_path(slug, *kind)));
+    let furthest = stages
+        .iter()
+        .rev()
+        .find(|stage| store.exists(&artifact_path(slug, &stage.id)));
 
-    let Some(kind) = furthest else {
+    let Some(stage) = furthest else {
+        let root = find_root(stages)?;
         return Ok(ChangeStatus {
             slug: slug.to_string(),
-            stage: ArtifactKind::Proposal.id(),
+            stage: root.id.clone(),
             state: ArtifactStatus::Pending,
             age: chrono::Duration::zero(),
         });
     };
 
-    let path = artifact_path(slug, kind);
+    let path = artifact_path(slug, &stage.id);
     let text = store.read_to_string(&path)?;
     let artifact = Artifact::parse(&path.display().to_string(), &text)?;
-    let recomputed = recompute_hash(store, slug, kind)?;
-    let state = if recomputed != artifact.frontmatter.source_hash {
-        ArtifactStatus::Stale
+    let state = if artifact.frontmatter.status == ArtifactStatus::NotApplicable {
+        ArtifactStatus::NotApplicable
     } else {
-        artifact.frontmatter.status
+        let recomputed = recompute_hash(store, slug, stages, &stage.id)?;
+        if recomputed != artifact.frontmatter.source_hash {
+            ArtifactStatus::Stale
+        } else {
+            artifact.frontmatter.status
+        }
     };
     let age = now - artifact.frontmatter.created;
 
     Ok(ChangeStatus {
         slug: slug.to_string(),
-        stage: kind.id(),
+        stage: stage.id.clone(),
         state,
         age,
     })
 }
 
-/// Every existing artifact whose stored hash no longer matches its
-/// inputs' current bodies, by id (e.g. `"design"`).
-fn stale_artifacts(store: &dyn Store, slug: &str) -> Result<Vec<&'static str>, ChangeError> {
+/// Every existing, non-`NotApplicable` artifact whose stored hash no
+/// longer matches its inputs' current bodies, by stage id.
+fn stale_artifacts(
+    store: &dyn Store,
+    slug: &str,
+    stages: &[StageDefinition],
+) -> Result<Vec<String>, ChangeError> {
     let mut stale = Vec::new();
-    for kind in ArtifactKind::ORDER {
-        let path = artifact_path(slug, kind);
+    for stage in stages {
+        let path = artifact_path(slug, &stage.id);
         if !store.exists(&path) {
             continue;
         }
         let text = store.read_to_string(&path)?;
         let artifact = Artifact::parse(&path.display().to_string(), &text)?;
-        if recompute_hash(store, slug, kind)? != artifact.frontmatter.source_hash {
-            stale.push(kind.id());
+        if artifact.frontmatter.status == ArtifactStatus::NotApplicable {
+            continue;
+        }
+        if recompute_hash(store, slug, stages, &stage.id)? != artifact.frontmatter.source_hash {
+            stale.push(stage.id.clone());
         }
     }
     Ok(stale)
@@ -288,14 +380,18 @@ fn stale_artifacts(store: &dyn Store, slug: &str) -> Result<Vec<&'static str>, C
 /// Archive a change: refuse if any of its artifacts are stale, apply
 /// `deltas/*` to `truth/` (each delta file replaces the truth file of
 /// the same name), then move the change directory into `archive/`.
-pub fn archive_change(store: &dyn Store, slug: &str) -> Result<(), ChangeError> {
+pub fn archive_change(
+    store: &dyn Store,
+    slug: &str,
+    stages: &[StageDefinition],
+) -> Result<(), ChangeError> {
     if !store.exists(&change_dir(slug)) {
         return Err(ChangeError::NotFound {
             slug: slug.to_string(),
         });
     }
 
-    let stale = stale_artifacts(store, slug)?;
+    let stale = stale_artifacts(store, slug, stages)?;
     if !stale.is_empty() {
         return Err(ChangeError::Stale {
             slug: slug.to_string(),
@@ -336,6 +432,7 @@ pub fn humanize_duration(duration: chrono::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stage::default_stages;
     use crate::workspace::FsStore;
     use tempfile::TempDir;
 
@@ -360,9 +457,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = store(&dir);
         let now = Utc::now();
-        new_change(&store, "add-widgets", now).unwrap();
+        let stages = default_stages();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Standard).unwrap();
 
-        let status = change_status(&store, "add-widgets", now).unwrap();
+        let status = change_status(&store, "add-widgets", now, &stages).unwrap();
         assert_eq!(status.stage, "proposal");
         assert_eq!(status.state, ArtifactStatus::Pending);
     }
@@ -372,8 +470,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = store(&dir);
         let now = Utc::now();
-        new_change(&store, "dup", now).unwrap();
-        let err = new_change(&store, "dup", now).unwrap_err();
+        let stages = default_stages();
+        new_change(&store, "dup", now, &stages, Rigor::Standard).unwrap();
+        let err = new_change(&store, "dup", now, &stages, Rigor::Standard).unwrap_err();
         assert!(matches!(err, ChangeError::AlreadyExists { .. }));
     }
 
@@ -382,11 +481,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = store(&dir);
         let now = Utc::now();
-        new_change(&store, "rework-auth", now).unwrap();
+        let stages = default_stages();
+        new_change(&store, "rework-auth", now, &stages, Rigor::Standard).unwrap();
 
         // Hand-craft a design.md whose hash matches the current proposal body,
         // simulating a design stage that already ran successfully.
-        let proposal_hash = recompute_hash(&store, "rework-auth", ArtifactKind::Design).unwrap();
+        let proposal_hash = recompute_hash(&store, "rework-auth", &stages, "design").unwrap();
         let design = Artifact {
             frontmatter: Frontmatter {
                 stage: "design".to_string(),
@@ -394,22 +494,23 @@ mod tests {
                 updated: now,
                 source_hash: proposal_hash,
                 status: ArtifactStatus::Valid,
+                rigor: None,
             },
             body: "Some design body.".to_string(),
         };
         store
             .write_string(
-                &artifact_path("rework-auth", ArtifactKind::Design),
+                &artifact_path("rework-auth", "design"),
                 &design.render().unwrap(),
             )
             .unwrap();
 
-        let status = change_status(&store, "rework-auth", now).unwrap();
+        let status = change_status(&store, "rework-auth", now, &stages).unwrap();
         assert_eq!(status.stage, "design");
         assert_eq!(status.state, ArtifactStatus::Valid);
 
         // Now edit the proposal body: design's stored hash no longer matches.
-        let proposal_path = artifact_path("rework-auth", ArtifactKind::Proposal);
+        let proposal_path = artifact_path("rework-auth", "proposal");
         let proposal_text = store.read_to_string(&proposal_path).unwrap();
         let mut proposal = Artifact::parse("proposal.md", &proposal_text).unwrap();
         proposal.body = "# Proposal\n\nCompletely different now.\n".to_string();
@@ -417,11 +518,11 @@ mod tests {
             .write_string(&proposal_path, &proposal.render().unwrap())
             .unwrap();
 
-        let status = change_status(&store, "rework-auth", now).unwrap();
+        let status = change_status(&store, "rework-auth", now, &stages).unwrap();
         assert_eq!(status.stage, "design");
         assert_eq!(status.state, ArtifactStatus::Stale);
 
-        let err = archive_change(&store, "rework-auth").unwrap_err();
+        let err = archive_change(&store, "rework-auth", &stages).unwrap_err();
         assert!(matches!(err, ChangeError::Stale { .. }));
     }
 
@@ -430,7 +531,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = store(&dir);
         let now = Utc::now();
-        new_change(&store, "add-widgets", now).unwrap();
+        let stages = default_stages();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Standard).unwrap();
         store
             .write_string(
                 &deltas_dir("add-widgets").join("widgets.md"),
@@ -438,7 +540,7 @@ mod tests {
             )
             .unwrap();
 
-        archive_change(&store, "add-widgets").unwrap();
+        archive_change(&store, "add-widgets", &stages).unwrap();
 
         assert!(!store.exists(&change_dir("add-widgets")));
         assert!(store.exists(&Path::new(ARCHIVE_DIR).join("add-widgets")));
@@ -448,5 +550,62 @@ mod tests {
                 .unwrap(),
             "Widgets can now be created.\n"
         );
+    }
+
+    #[test]
+    fn change_rigor_defaults_to_deep_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let stages = default_stages();
+        assert_eq!(
+            change_rigor(&store, &stages, "nonexistent").unwrap(),
+            Rigor::Deep
+        );
+    }
+
+    #[test]
+    fn change_rigor_reads_stored_value() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let now = Utc::now();
+        let stages = default_stages();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Trivial).unwrap();
+        assert_eq!(
+            change_rigor(&store, &stages, "add-widgets").unwrap(),
+            Rigor::Trivial
+        );
+    }
+
+    #[test]
+    fn not_applicable_artifact_is_never_reported_stale() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let now = Utc::now();
+        let stages = default_stages();
+        new_change(&store, "tiny-fix", now, &stages, Rigor::Trivial).unwrap();
+
+        let skipped = Artifact {
+            frontmatter: Frontmatter {
+                stage: "design".to_string(),
+                created: now,
+                updated: now,
+                source_hash: "does-not-matter".to_string(),
+                status: ArtifactStatus::NotApplicable,
+                rigor: None,
+            },
+            body: "Skipped: rigor too low.".to_string(),
+        };
+        store
+            .write_string(
+                &artifact_path("tiny-fix", "design"),
+                &skipped.render().unwrap(),
+            )
+            .unwrap();
+
+        let status = change_status(&store, "tiny-fix", now, &stages).unwrap();
+        assert_eq!(status.state, ArtifactStatus::NotApplicable);
+
+        archive_change(&store, "tiny-fix", &stages).unwrap();
+        assert!(store.exists(&Path::new(ARCHIVE_DIR).join("tiny-fix")));
     }
 }

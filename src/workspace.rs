@@ -12,6 +12,18 @@ pub const DELTA_DIR: &str = ".delta";
 pub const TRUTH_DIR: &str = "truth";
 pub const CHANGES_DIR: &str = "changes";
 pub const ARCHIVE_DIR: &str = "archive";
+pub const STAGES_DIR: &str = "stages";
+
+/// Default stage definitions, seeded into `.delta/stages/` on `init` so
+/// a fresh workspace is immediately runnable. Once seeded, `stage.rs`
+/// reads exclusively from disk — editing or adding a `.delta/stages/
+/// *.yaml` file never requires a recompile; these `include_str!`s only
+/// supply the starting point.
+const DEFAULT_STAGES: [(&str, &str); 3] = [
+    ("proposal.yaml", include_str!("../stages/proposal.yaml")),
+    ("design.yaml", include_str!("../stages/design.yaml")),
+    ("tasks.yaml", include_str!("../stages/tasks.yaml")),
+];
 
 /// Directories from other spec-driven-development tools. `init` notes
 /// their presence; importing them is explicitly out of scope for now.
@@ -138,6 +150,10 @@ impl Workspace {
         store.create_dir_all(Path::new(TRUTH_DIR))?;
         store.create_dir_all(Path::new(CHANGES_DIR))?;
         store.create_dir_all(Path::new(ARCHIVE_DIR))?;
+        store.create_dir_all(Path::new(STAGES_DIR))?;
+        for (filename, contents) in DEFAULT_STAGES {
+            store.write_string(&Path::new(STAGES_DIR).join(filename), contents)?;
+        }
         Ok(Self { root, store })
     }
 
@@ -172,6 +188,23 @@ mod tests {
         assert!(workspace.store().exists(Path::new(TRUTH_DIR)));
         assert!(workspace.store().exists(Path::new(CHANGES_DIR)));
         assert!(workspace.store().exists(Path::new(ARCHIVE_DIR)));
+    }
+
+    #[test]
+    fn init_seeds_default_stages() {
+        let repo = TempDir::new().unwrap();
+        let workspace = Workspace::init(repo.path()).unwrap();
+        for filename in ["proposal.yaml", "design.yaml", "tasks.yaml"] {
+            let path = Path::new(STAGES_DIR).join(filename);
+            assert!(workspace.store().exists(&path), "missing {filename}");
+            assert!(
+                workspace
+                    .store()
+                    .read_to_string(&path)
+                    .unwrap()
+                    .contains("id:")
+            );
+        }
     }
 
     #[test]

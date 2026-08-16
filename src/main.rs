@@ -27,9 +27,9 @@ fn main() -> ExitCode {
 fn run() -> anyhow::Result<ExitCode> {
     let cli = cli::Cli::parse();
     let repo_root = std::env::current_dir()?;
-    let _config = config::Config::load(&repo_root)?;
+    let config = config::Config::load(&repo_root)?;
 
-    match cli::dispatch(&cli.command, &repo_root) {
+    match cli::dispatch(&cli.command, &repo_root, &config) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(err) => {
             eprintln!("error: {err}");

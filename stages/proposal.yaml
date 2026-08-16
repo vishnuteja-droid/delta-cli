@@ -1,0 +1,17 @@
+id: proposal
+name: Proposal
+inputs: []
+min_rigor: trivial
+template: |
+  {{ agents_md }}
+  ## Current truth
+  {{ truth.relevant }}
+  ## Repository
+  {{ repo_tree }}
+  Describe the change: the problem it solves and the shape of the fix.
+output:
+  required_sections: [Problem, Approach]
+  validators:
+    - non_empty_sections
+    - no_placeholder_text
+    - min_words: 50
