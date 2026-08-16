@@ -10,13 +10,32 @@ mod tui;
 mod verify;
 mod workspace;
 
-use anyhow::Result;
+use std::process::ExitCode;
 
-fn main() -> Result<()> {
+use clap::Parser;
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run() -> anyhow::Result<ExitCode> {
+    let cli = cli::Cli::parse();
     let repo_root = std::env::current_dir()?;
     let _config = config::Config::load(&repo_root)?;
-    println!("dlt — skeleton (prompt 0)");
-    Ok(())
+
+    match cli::dispatch(&cli.command, &repo_root) {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(err) => {
+            eprintln!("error: {err}");
+            Ok(ExitCode::from(err.exit_code()))
+        }
+    }
 }
 
 #[cfg(test)]

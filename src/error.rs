@@ -21,7 +21,6 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // constructed once workspace.rs gains real logic in prompt 1
 pub enum WorkspaceError {
     #[error("not a delta workspace (no .delta directory found)")]
     NotInitialized,
@@ -36,7 +35,6 @@ pub enum WorkspaceError {
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // constructed once change.rs gains real logic in prompt 1
 pub enum ChangeError {
     #[error("unknown change {slug}")]
     NotFound { slug: String },
@@ -44,6 +42,38 @@ pub enum ChangeError {
     AlreadyExists { slug: String },
     #[error("invalid artifact frontmatter in {path}: {reason}")]
     InvalidFrontmatter { path: String, reason: String },
+    #[error("invalid change slug {slug:?}: use lowercase letters, digits, - and _ only")]
+    InvalidSlug { slug: String },
+    #[error("change {slug} has stale artifacts and cannot be archived: {artifacts}")]
+    Stale { slug: String, artifacts: String },
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+}
+
+/// Top-level error for CLI dispatch. Its only job beyond wrapping the
+/// per-module errors is mapping each to the exit code CI depends on:
+/// 0 ok, 1 internal, 2 validation failed, 3 gate not satisfied, 4 stale inputs.
+#[derive(Debug, Error)]
+pub enum CliError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
+}
+
+impl CliError {
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            CliError::Config(_) => 1,
+            CliError::Workspace(WorkspaceError::Io { .. }) => 1,
+            CliError::Workspace(_) => 2,
+            CliError::Change(ChangeError::Workspace(WorkspaceError::Io { .. })) => 1,
+            CliError::Change(ChangeError::Stale { .. }) => 4,
+            CliError::Change(_) => 2,
+        }
+    }
 }
 
 #[derive(Debug, Error)]

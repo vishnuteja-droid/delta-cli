@@ -13,7 +13,7 @@ expect_used = "deny"
 
 [dependencies]
 anyhow = "1.0.104"
-chrono = "0.4.45"
+chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.6", features = ["derive"] }
 directories = "6.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -24,4 +24,5 @@ thiserror = "2.0.20"
 toml = "1.1.4"
 
 [dev-dependencies]
+assert_cmd = "2.2.2"
 tempfile = "3.27.0"
