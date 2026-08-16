@@ -1,0 +1,27 @@
+[package]
+name = "delta-cli"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "dlt"
+path = "src/main.rs"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+clap = { version = "4.6.6", features = ["derive"] }
+directories = "6.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml = "0.9.34"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+toml = "1.1.4"
+
+[dev-dependencies]
+tempfile = "3.27.0"
