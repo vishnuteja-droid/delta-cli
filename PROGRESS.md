@@ -166,3 +166,133 @@ them, otherwise let prompt 3 add `minijinja` when it's actually used.
 - `cli.rs` still doesn't read anything from `config.rs` — no command's behavior depends on
   config yet. That's expected; prompt 2's provider config (`[providers.*]`) will be the first
   thing `cli.rs` (or whatever calls providers) actually needs to read back out.
+
+## Session 2 — Prompt 2 (provider layer)
+
+**Shipped:**
+
+- `provider.rs` (module root) + `provider/openai_compatible.rs` + `provider/anthropic.rs`:
+  - `Request`/`Message`/`Role`/`Delta`: minimal chat-completion types — just enough for prompt
+    3's stage machine to assemble a prompt and stream a completion. No tool-use, no images.
+  - `trait Provider`: `name()`, `context_window()`, `count_tokens()`, and a native `async fn
+    stream(...) -> Result<BoxStream<'static, Result<Delta, ProviderError>>, ProviderError>`.
+    Native async fn in traits (stable since Rust 1.75) isn't dyn-compatible, so there's no
+    `Box<dyn Provider>` — instead `AnyProvider` is a plain enum (`OpenAiCompatible` |
+    `Anthropic`) that implements `Provider` by matching and delegating. `provider::load(config,
+    name)` reads `[providers.<name>]` out of `config.rs`'s generic table and constructs the
+    right variant.
+  - `OpenAiCompatible`: POSTs `{base_url}/chat/completions` with `stream: true`, Bearer auth,
+    parses `data: {...}` / `data: [DONE]` SSE frames, extracts `choices[0].delta.content`.
+  - `AnthropicProvider`: POSTs `{base_url}/messages`, `x-api-key` + `anthropic-version:
+    2023-06-01` headers, parses `event: content_block_delta` frames with `delta.type ==
+    "text_delta"`; a server-sent `event: error` surfaces as `Err`; every other event type
+    (`message_start`, `content_block_start/stop`, `message_delta`, `message_stop`, `ping`) is
+    structural and skipped without ending the stream.
+  - `send_with_retry`: exponential backoff with jitter (`backoff::future::retry` +
+    `ExponentialBackoffBuilder`, 500ms initial / 30s max interval / 120s max elapsed) on `429`
+    and `5xx`; honors a `Retry-After: <seconds>` header when present via
+    `backoff::Error::retry_after`; every other non-2xx status is permanent (no retry).
+  - `with_cancellation`: wraps a boxed+pinned stream in `futures::stream::unfold` racing
+    `cancel.cancelled()` against `stream.next()` via `tokio::select!` — the literal "abortable
+    mid-flight via `CancellationToken`" requirement. `send_with_retry` also checks
+    `cancel.is_cancelled()` before every attempt, so cancelling before the request even goes
+    out fails fast with `ProviderError::Cancelled` rather than silently returning an empty
+    stream — see `stream_fails_fast_when_token_already_cancelled`.
+  - `count_tokens`: a chars/4 heuristic (`approximate_token_count`), explicitly documented as a
+    placeholder — real tokenization is prompt 3's `tiktoken-rs or equivalent`, not prompt 2's.
+  - Provider config beyond the literal PLAN.md TOML example: `context_window` is an optional
+    per-provider integer (default `128_000`) since neither the Chat Completions nor Messages
+    API reports its model's context window — prompt 3 needs `Provider::context_window()` for
+    budget management, so something has to supply it, and config is the only place available
+    without hardcoding a model-name table. `headers` is an optional `[providers.<name>.headers]`
+    sub-table applied as extra request headers on every call, per "Both configured by base_url,
+    model, api_key_env, headers" in the prompt text.
+- `error.rs`: `ProviderError` is now real (`NotConfigured`, `MissingConfig`, `InvalidConfig`,
+  `MissingApiKey`, `Request`, `Http`, `MalformedStream`, `Cancelled`) — no `CliError` exit-code
+  mapping added yet since nothing in `cli.rs` calls providers until prompt 3.
+- `config.rs`: dropped the now-stale `#[allow(dead_code)]` on `Config::get`/`get_str`/`table`
+  now that `provider.rs` genuinely reads them.
+
+**Fixed incidentally (found while sanity-checking test output at session start, unrelated to
+prompt 2's scope but a real bug):**
+
+- `config.rs`'s env-var tests (`env_overrides_files`, `nested_env_override`) mutate
+  process-global env vars while `defaults_only_when_no_files_present` (which scans all
+  `DELTA_*` vars via `Config::load`) can run concurrently on another thread under the default
+  parallel `cargo test` — an actual flake, reproduced at the top of this session. Fixed with a
+  module-local `static ENV_LOCK: Mutex<()>` that every test in `config::tests` holds for its
+  whole body, serializing them against each other regardless of run order. Confirmed fixed
+  with three consecutive default-parallelism `cargo test` runs, all green.
+
+**Dependency / TLS-stack notes — the one real surprise this session:**
+
+- `reqwest` had to be **pinned to `0.12`**, not `0.13` (the version `cargo add` picks by
+  default). reqwest 0.13 restructured its TLS features: every rustls-enabling feature (`rustls`,
+  `rustls-no-provider`, `http3`, `default-tls`) now pulls in `rustls-platform-verifier` (OS
+  trust store, not compiled-in roots) and, for `rustls`/`default-tls`/`http3` specifically,
+  `aws-lc-rs` → `aws-lc-sys`, a full C crypto library — a hard violation of "no C dependencies
+  anywhere." There is no webpki-roots-backed feature combination left in 0.13 at all. reqwest
+  0.12 still has the classic `rustls-tls-webpki-roots` feature (ring-backed, no
+  platform-verifier, no aws-lc-sys), which is what's actually in `Cargo.toml`:
+  `reqwest = { version = "0.12", default-features = false, features = ["json", "stream",
+  "rustls-tls-webpki-roots"] }`. Confirmed via `Cargo.lock`: `ring` present, `webpki-roots`
+  present, no `aws-lc-sys`/`native-tls`/`openssl` anywhere in the tree.
+- `tokio-util` provides `CancellationToken` (used for cancellation) and also re-exports the
+  `bytes` crate as `tokio_util::bytes` — used in tests instead of adding `bytes` as a direct
+  dependency.
+- **The "verify from a static musl build with no system cert store, do not defer this" line
+  was taken literally and actually done in this session**, not deferred to prompt 7:
+  `rustup target add x86_64-unknown-linux-musl` + `apt-get install musl-tools`, confirmed
+  `file`/`ldd` report the `dlt` binary as `static-pie linked, statically linked` (no dynamic
+  deps at all). Built a throwaway `examples/tls_smoke_test.rs` (deleted after use, not part of
+  the crate) making one real HTTPS request through this exact `reqwest` configuration, ran it
+  under `strace -e trace=openat,open,access,stat,newfstatat` with `env -i` (no `HOME`, no
+  `SSL_CERT_FILE`/`SSL_CERT_DIR`, nothing an OS-trust-store code path could fall back to). The
+  request completed a real TLS handshake and got HTTP 200 back, and the strace log has zero
+  matches for `ssl/certs|ca-certificates|/etc/pki|/etc/ssl|share/ca-cert` — the binary never
+  touched a filesystem cert store at all, proving webpki-roots' compiled-in roots are what's
+  actually being used, not something incidentally reachable in this dev sandbox.
+
+**Verified:**
+
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo test` — 33 passing (26 unit including 11 new provider tests across `provider`,
+  `provider::openai_compatible`, `provider::anthropic`; 7 `tests/cli.rs` integration, unchanged
+  from prompt 1). All against a mock HTTP server (`wiremock`) — no live API calls in the
+  checked-in test suite, per the prompt's explicit requirement.
+- `cargo fmt --check` clean.
+- `cargo build --target x86_64-unknown-linux-musl` — clean, see the TLS verification above.
+- The SSE frame-split-across-chunk-boundaries requirement is tested directly at the parsing
+  seam rather than through wiremock's declarative body API: wiremock has no control over actual
+  TCP chunk boundaries (loopback typically coalesces a small body into one read regardless of
+  what the mock's `ResponseTemplate` describes), so
+  `reassembles_sse_event_split_across_chunk_boundaries` in both provider test modules instead
+  feeds `eventsource_stream::Eventsource` a `futures::stream::iter` of two `Bytes` chunks that
+  split a single SSE event mid-field, and asserts it reassembles into one complete `Event`. The
+  wiremock-based tests separately prove the full HTTP-to-`Delta` pipeline wires together
+  correctly end to end.
+
+**What prompt 3 should assume:**
+
+- `provider::load(config, name) -> Result<AnyProvider, ProviderError>` exists and works; the
+  stage machine should call this rather than constructing `OpenAiCompatible`/`AnthropicProvider`
+  directly. `AnyProvider` implements `Provider`, so generic code can just take `&impl Provider`
+  or match on it directly — there's no dyn story to route around.
+  `dlt run <stage>` in prompt 3 is the **first real caller** of this module from `cli.rs`; until
+  then everything in `provider.rs`/`provider/*.rs` is marked `#![allow(dead_code)]` at the
+  module root (fully implemented and tested, just not wired to any command yet) — remove that
+  attribute once `cli.rs` calls in.
+- `Provider::count_tokens` is a chars/4 approximation, not real tokenization — prompt 3 is
+  explicitly where `tiktoken-rs or equivalent` gets added per `PLAN.md`'s dependency table; swap
+  the implementation then, the trait signature doesn't need to change.
+- `Provider::context_window()` comes from an optional `context_window` key under
+  `[providers.<name>]` (default `128_000` if omitted) — this key is **not** in `PLAN.md`'s
+  literal example TOML, so example/test configs prompt 3 writes should either set it explicitly
+  or accept the default; don't assume it's derived from the model name.
+- No `CliError`/exit-code mapping exists yet for `ProviderError` — prompt 3's `dlt run` will be
+  the first place that needs to decide, e.g., whether a `ProviderError::Http` is exit code 1
+  (internal/network) or something else; nothing in prompt 2 presupposes an answer.
+- `CancellationToken` plumbing is in place end-to-end (`Provider::stream` takes one, honors it
+  both pre-flight in `send_with_retry` and mid-flight via `with_cancellation`) — prompt 6's `esc
+  to interrupt` (or prompt 3's own interrupt handling, if it needs any before the TUI exists)
+  can create one, pass it down, and call `.cancel()` from wherever the interrupt signal lands.

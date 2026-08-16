@@ -84,10 +84,31 @@ pub enum StageError {
 }
 
 #[derive(Debug, Error)]
-#[allow(dead_code)] // constructed once provider.rs gains real logic in prompt 2
 pub enum ProviderError {
-    #[error("provider layer not yet implemented")]
-    Unimplemented,
+    #[error("no provider named {name:?} configured (expected a [providers.{name}] table)")]
+    NotConfigured { name: String },
+    #[error("provider {name:?} is missing required config key {key:?}")]
+    MissingConfig { name: String, key: String },
+    #[error("provider {name:?} has invalid config: {reason}")]
+    InvalidConfig { name: String, reason: String },
+    #[error("environment variable {env_var:?} (provider {name:?}'s api_key_env) is not set")]
+    MissingApiKey { name: String, env_var: String },
+    #[error("request to provider {name:?} failed: {source}")]
+    Request {
+        name: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("provider {name:?} returned HTTP {status}: {body}")]
+    Http {
+        name: String,
+        status: u16,
+        body: String,
+    },
+    #[error("provider {name:?} sent a malformed stream event: {reason}")]
+    MalformedStream { name: String, reason: String },
+    #[error("request to provider {name:?} was cancelled")]
+    Cancelled { name: String },
 }
 
 #[derive(Debug, Error)]

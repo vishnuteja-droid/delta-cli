@@ -18,7 +18,6 @@ use crate::error::ConfigError;
 /// to know their shape.
 #[derive(Debug, Clone, Default)]
 pub struct Config {
-    #[allow(dead_code)] // read via get()/get_str() once cli.rs consumes config in prompt 1
     table: Table,
 }
 
@@ -49,13 +48,11 @@ impl Config {
     }
 
     /// Fetch a string value by dotted key path, e.g. `"providers.default.model"`.
-    #[allow(dead_code)] // consumed by cli.rs once it reads config in prompt 1
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.get(key)?.as_str()
     }
 
     /// Fetch a raw value by dotted key path.
-    #[allow(dead_code)] // consumed by cli.rs once it reads config in prompt 1
     pub fn get(&self, key: &str) -> Option<&Value> {
         let mut current = self.table.get(key.split('.').next()?)?;
         for segment in key.split('.').skip(1) {
@@ -139,10 +136,20 @@ pub fn user_config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    // `Config::load` scans every `DELTA_*` env var, and env vars are
+    // process-global — two of these tests running in parallel on
+    // different threads (the cargo test default) can otherwise observe
+    // each other's `set_var`/`remove_var` mid-test. Every test here
+    // holds this lock for its whole body so they serialize against each
+    // other regardless of which ones happen to touch env vars.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn defaults_only_when_no_files_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let repo = TempDir::new().unwrap();
         let config = Config::load(repo.path()).unwrap();
         assert_eq!(config.get_str("workspace_dir"), Some(".delta"));
@@ -150,6 +157,7 @@ mod tests {
 
     #[test]
     fn repo_config_overrides_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let repo = TempDir::new().unwrap();
         std::fs::create_dir_all(repo.path().join(".delta")).unwrap();
         let mut file = std::fs::File::create(repo.path().join(".delta/config.toml")).unwrap();
@@ -160,8 +168,9 @@ mod tests {
 
     #[test]
     fn env_overrides_files() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let repo = TempDir::new().unwrap();
-        // SAFETY: test-only, single-threaded within this test body.
+        // SAFETY: test-only, serialized against other env-mutating tests via ENV_LOCK.
         unsafe {
             std::env::set_var("DELTA_WORKSPACE_DIR", "from-env");
         }
@@ -174,6 +183,7 @@ mod tests {
 
     #[test]
     fn nested_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let repo = TempDir::new().unwrap();
         unsafe {
             std::env::set_var("DELTA_PROVIDERS__DEFAULT__MODEL", "gpt-test");
