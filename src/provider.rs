@@ -1,9 +1,11 @@
 //! LLM provider abstraction: async streaming completions, retry with
-//! backoff, and mid-flight cancellation, with `OpenAiCompatible` and
-//! `Anthropic` implementations declared in `config.rs` and constructed
-//! here via [`load`]. Driven by `dlt run <stage>` in `cli.rs`.
+//! backoff, and mid-flight cancellation, with `OpenAiCompatible`,
+//! `Anthropic`, and `Gemini` implementations declared in `config.rs` and
+//! constructed here via [`load`]. Driven by `dlt run <stage>` in
+//! `cli.rs`.
 
 pub mod anthropic;
+pub mod gemini;
 pub mod openai_compatible;
 
 use std::collections::BTreeMap;
@@ -74,6 +76,7 @@ pub trait Provider: Send + Sync {
 pub enum AnyProvider {
     OpenAiCompatible(openai_compatible::OpenAiCompatible),
     Anthropic(anthropic::AnthropicProvider),
+    Gemini(gemini::GeminiProvider),
 }
 
 impl Provider for AnyProvider {
@@ -81,6 +84,7 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::OpenAiCompatible(p) => p.name(),
             AnyProvider::Anthropic(p) => p.name(),
+            AnyProvider::Gemini(p) => p.name(),
         }
     }
 
@@ -88,6 +92,7 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::OpenAiCompatible(p) => p.context_window(),
             AnyProvider::Anthropic(p) => p.context_window(),
+            AnyProvider::Gemini(p) => p.context_window(),
         }
     }
 
@@ -95,6 +100,7 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::OpenAiCompatible(p) => p.count_tokens(text),
             AnyProvider::Anthropic(p) => p.count_tokens(text),
+            AnyProvider::Gemini(p) => p.count_tokens(text),
         }
     }
 
@@ -106,6 +112,7 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::OpenAiCompatible(p) => p.stream(request, cancel).await,
             AnyProvider::Anthropic(p) => p.stream(request, cancel).await,
+            AnyProvider::Gemini(p) => p.stream(request, cancel).await,
         }
     }
 }
@@ -141,10 +148,13 @@ pub fn load(config: &Config, name: &str) -> Result<AnyProvider, ProviderError> {
         "anthropic" => Ok(AnyProvider::Anthropic(anthropic::AnthropicProvider::new(
             name, &spec, api_key,
         ))),
+        "gemini" => Ok(AnyProvider::Gemini(gemini::GeminiProvider::new(
+            name, &spec, api_key,
+        ))),
         other => Err(ProviderError::InvalidConfig {
             name: name.to_string(),
             reason: format!(
-                "unknown provider kind {other:?} (expected \"openai_compatible\" or \"anthropic\")"
+                "unknown provider kind {other:?} (expected \"openai_compatible\", \"anthropic\", or \"gemini\")"
             ),
         }),
     }

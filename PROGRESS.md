@@ -733,3 +733,70 @@ test suite itself before anything shipped):**
   policy fallback lives in `tools::default_policy`, the allowlist's absence just means "nothing
   runnable" by design) — if prompt 6's TUI exposes a settings/config view, these are real,
   user-facing knobs worth surfacing, not just internal wiring.
+
+## Between sessions — Gemini provider (user request, not a PLAN.md prompt)
+
+Before starting prompt 6, the user asked to hold off on the TUI and validate prompts 1–5 on a
+real change with a real provider first — the literal "Order discipline" gate in `PLAN.md`
+("Do not start prompt 6 until prompts 1–5 have been used on a real change in a real repository")
+had not actually been satisfied by any session so far; every prior manual check was `--dry-run`
+or an error-path check, never a live model call. In the same breath, the user asked to add more
+providers ("like gemini") so they could do that live test themselves, and asked how to run `dlt`.
+
+**Shipped:** `provider/gemini.rs`, a third `AnyProvider` variant (`kind = "gemini"`) alongside
+`openai_compatible`/`anthropic`, following the exact structure of `provider/anthropic.rs`: a
+`Provider` impl, `send_with_retry`/`with_cancellation` reused unchanged, `eventsource-stream` for
+SSE framing. Specifics that differ from the other two:
+- Streaming endpoint is `{base_url}/models/{model}:streamGenerateContent?alt=sse` — the `alt=sse`
+  query param is load-bearing; without it the Generative Language API returns one large chunked
+  JSON array instead of discrete SSE events, which `eventsource-stream` can't parse.
+- Auth is the `x-goog-api-key` header (not `x-api-key`, not `Bearer`).
+- Request shape is Gemini's own `contents: [{role, parts: [{text}]}]` +
+  `systemInstruction: {parts: [{text}]}` + `generationConfig.maxOutputTokens` — nothing like the
+  other two providers' bodies. Gemini has no "assistant" role; prior model turns use `"model"`.
+- Each SSE frame is a **complete** `GenerateContentResponse`, not a small incremental delta the
+  way Anthropic's `text_delta` or OpenAI's `delta.content` are — `parse_event` extracts
+  `candidates[0].content.parts[].text`, concatenating multiple `parts` in one frame. An inline
+  `{"error": ...}` body (Gemini can send one even inside a nominally-200 SSE stream) surfaces as
+  `ProviderError::MalformedStream`, same as a genuinely malformed JSON body.
+- No new crate dependencies — `reqwest`/`eventsource-stream`/`serde_json`/`tokio-util` were
+  already present from prompt 2.
+
+`provider.rs`'s `load()` gained a `"gemini"` arm; the `InvalidConfig` error message for an
+unrecognized `kind` now lists all three. `AnyProvider`'s four trait-method match statements each
+gained a `Gemini(p) =>` arm.
+
+**Verified:** `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean,
+`cargo test` — 124 passing (117 unit including 7 new `provider::gemini` tests mirroring the
+Anthropic suite's structure — streaming across multiple frames, multi-`parts` concatenation,
+SSE-split-across-chunk-boundaries, inline error body, 503 retry, non-retryable 400, fail-fast on
+pre-cancellation; 7 `tests/cli.rs` integration, unchanged). No live Gemini API call in the checked-
+in suite, consistent with the "no live API calls in the test suite" rule from prompt 2 — the user
+is doing that live validation themselves, outside this session, with their own API key.
+
+**Order-discipline status:** still open, not skipped. The user is now running the actual live
+validation `PLAN.md` asks for (`dlt init` → `change new` → `run` through the stages → `dlt build`
+against a real provider, likely Gemini given this addition) outside this session. Prompt 6 should
+not start until that's confirmed done — check for a follow-up message reporting success (or new
+bugs to fix) before writing any TUI code.
+
+**Running `dlt` — for reference, since there's no README yet (prompt 7's job):**
+1. `cargo build --release` (or `cargo run --` during development).
+2. In the target repo: `dlt init`, then `dlt change new <slug>`.
+3. Add a provider to `.delta/config.toml` (repo-rooted) or `~/.config/delta/config.toml`, e.g. for
+   Gemini:
+   ```toml
+   [providers.default]
+   kind = "gemini"
+   base_url = "https://generativelanguage.googleapis.com/v1beta"
+   model = "gemini-2.0-flash"
+   api_key_env = "GEMINI_API_KEY"
+   ```
+   (`export GEMINI_API_KEY=...` in the shell — never written to config itself.)
+4. `dlt run proposal --change <slug>` (then `design`, then `tasks`) — each streams the
+   completion to stdout and writes the artifact; add `--dry-run` first to sanity-check the
+   assembled prompt without spending any tokens.
+5. `dlt verify <slug>` once a stage's artifact has `## Acceptance Criteria` checks in it.
+6. `dlt build <slug>` to run the tool loop — it will print a diff or command and ask `[y/N]`
+   before any write or command execution (`[tools.<name>].policy` in config changes that).
+7. `dlt undo` reverts the most recent `write_file`/`apply_patch` from `dlt build` if needed.
