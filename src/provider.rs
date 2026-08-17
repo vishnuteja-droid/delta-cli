@@ -43,10 +43,20 @@ pub enum Role {
     Assistant,
 }
 
-/// One incremental chunk of assistant text.
+/// One incremental chunk of assistant output: either visible `Text`
+/// (part of the model's actual response) or `Reasoning` — Anthropic's
+/// `thinking_delta`, OpenAI-compatible reasoning-model servers'
+/// `reasoning_content` delta field, or Gemini's `thought`-flagged parts.
+/// Kept distinct rather than folded into `Text` so callers never let a
+/// model's chain-of-thought leak into a saved artifact or a tool-call
+/// parse (prompt 5's `tools::agent`), and so prompt 6's TUI can render
+/// it as a collapsible, visually distinct block instead of ordinary
+/// output. Not every backend streams reasoning; providers that don't
+/// simply never emit this variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Delta {
-    pub text: String,
+pub enum Delta {
+    Text(String),
+    Reasoning(String),
 }
 
 /// An LLM provider: streaming completions plus the metadata the stage

@@ -1,6 +1,8 @@
 //! Anthropic Messages API provider: `x-api-key` auth, the
 //! `anthropic-version` header, and `event:`-discriminated SSE frames
-//! (`content_block_delta` carrying `text_delta` chunks).
+//! (`content_block_delta` carrying `text_delta` or `thinking_delta`
+//! chunks — the latter is extended-thinking content, surfaced as
+//! `Delta::Reasoning` for prompt 6's TUI to render distinctly).
 
 use std::collections::BTreeMap;
 
@@ -121,12 +123,13 @@ impl Provider for AnthropicProvider {
     }
 }
 
-/// Parse one SSE event. Only `content_block_delta` events carrying a
-/// `text_delta` produce visible text; `message_start`,
-/// `content_block_start/stop`, `message_delta`, `message_stop`, and
-/// `ping` are structural and are skipped (`None`), same as `filter_map`
-/// skips them without ending the stream. A server-sent `event: error`
-/// surfaces as an `Err`.
+/// Parse one SSE event. `content_block_delta` events carry either a
+/// `text_delta` (visible output) or a `thinking_delta` (extended
+/// thinking, under `delta.thinking` rather than `delta.text`);
+/// `message_start`, `content_block_start/stop`, `message_delta`,
+/// `message_stop`, and `ping` are structural and are skipped (`None`),
+/// same as `filter_map` skips them without ending the stream. A
+/// server-sent `event: error` surfaces as an `Err`.
 fn parse_event(event: &Event, name: &str) -> Option<Result<Delta, ProviderError>> {
     match event.event.as_str() {
         "content_block_delta" => {
@@ -140,16 +143,23 @@ fn parse_event(event: &Event, name: &str) -> Option<Result<Delta, ProviderError>
                 }
             };
             let delta = value.get("delta")?;
-            if delta.get("type")?.as_str()? != "text_delta" {
-                return None;
+            match delta.get("type")?.as_str()? {
+                "text_delta" => {
+                    let text = delta.get("text")?.as_str()?;
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(Ok(Delta::Text(text.to_string())))
+                }
+                "thinking_delta" => {
+                    let thinking = delta.get("thinking")?.as_str()?;
+                    if thinking.is_empty() {
+                        return None;
+                    }
+                    Some(Ok(Delta::Reasoning(thinking.to_string())))
+                }
+                _ => None,
             }
-            let text = delta.get("text")?.as_str()?;
-            if text.is_empty() {
-                return None;
-            }
-            Some(Ok(Delta {
-                text: text.to_string(),
-            }))
         }
         "error" => Some(Err(ProviderError::MalformedStream {
             name: name.to_string(),
@@ -233,12 +243,50 @@ mod tests {
         assert_eq!(
             deltas,
             vec![
-                Delta {
-                    text: "Hel".to_string()
-                },
-                Delta {
-                    text: "lo!".to_string()
-                },
+                Delta::Text("Hel".to_string()),
+                Delta::Text("lo!".to_string()),
+            ]
+        );
+    }
+
+    /// `thinking_delta` events must surface as `Delta::Reasoning`, kept
+    /// distinct from `text_delta`'s `Delta::Text` — this is what lets a
+    /// caller (the TUI, or `run_stage`'s body accumulator) tell a
+    /// model's visible answer apart from its chain-of-thought.
+    #[tokio::test]
+    async fn thinking_delta_surfaces_as_reasoning_distinct_from_text() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me consider...\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Answer.\"}}\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider =
+            AnthropicProvider::new("default", &spec(server.uri()), "sk-ant-test".to_string());
+        let deltas: Vec<Delta> = provider
+            .stream(request(), CancellationToken::new())
+            .await
+            .unwrap()
+            .map(|d| d.unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(
+            deltas,
+            vec![
+                Delta::Reasoning("Let me consider...".to_string()),
+                Delta::Text("Answer.".to_string()),
             ]
         );
     }
@@ -324,11 +372,6 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(
-            deltas,
-            vec![Delta {
-                text: "ok".to_string()
-            }]
-        );
+        assert_eq!(deltas, vec![Delta::Text("ok".to_string())]);
     }
 }

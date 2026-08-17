@@ -2,7 +2,9 @@
 //! auth, `:streamGenerateContent?alt=sse` for real SSE framing (without
 //! `alt=sse` the API instead returns one large chunked JSON array, not
 //! discrete events), and Gemini's own `contents`/`systemInstruction`
-//! request shape rather than either other provider's.
+//! request shape rather than either other provider's. `thought: true`
+//! parts (Gemini's thinking-mode reasoning content) surface as
+//! `Delta::Reasoning`, distinct from ordinary `Delta::Text` parts.
 
 use std::collections::BTreeMap;
 
@@ -108,58 +110,84 @@ impl Provider for GeminiProvider {
         let events = with_cancellation(events, cancel);
 
         let name_for_events = name.clone();
-        let deltas = events.filter_map(move |event| {
+        let deltas = events.flat_map(move |event| {
             let name = name_for_events.clone();
-            std::future::ready(match event {
+            let results = match event {
                 Ok(event) => parse_event(&event, &name),
-                Err(source) => Some(Err(ProviderError::MalformedStream {
+                Err(source) => vec![Err(ProviderError::MalformedStream {
                     name,
                     reason: source.to_string(),
-                })),
-            })
+                })],
+            };
+            futures::stream::iter(results)
         });
 
         Ok(Box::pin(deltas))
     }
 }
 
-/// Parse one SSE event. Each frame is a full `GenerateContentResponse`
-/// JSON object (unlike Anthropic/OpenAI's small incremental deltas,
-/// Gemini's frames are self-contained), whose visible text is the
-/// concatenation of `candidates[0].content.parts[].text`. A frame with
-/// no candidates or empty text yields no delta; an `{"error": ...}`
-/// body (Gemini can send one inline even inside a 200 SSE stream) or a
-/// malformed JSON body both surface as `Err`.
-fn parse_event(event: &Event, name: &str) -> Option<Result<Delta, ProviderError>> {
+/// Parse one SSE event into zero or more deltas. Each frame is a full
+/// `GenerateContentResponse` JSON object (unlike Anthropic/OpenAI's
+/// small incremental deltas, Gemini's frames are self-contained) whose
+/// `candidates[0].content.parts` array can, in principle, mix regular
+/// output with `thought: true`-flagged reasoning parts in the same
+/// frame — hence returning a `Vec` rather than a single `Option`, so
+/// both survive as separate deltas instead of one silently overwriting
+/// the other. A frame with no candidates or no non-empty parts yields
+/// nothing; an `{"error": ...}` body (Gemini can send one inline even
+/// inside a 200 SSE stream) or a malformed JSON body both surface as a
+/// single `Err`.
+fn parse_event(event: &Event, name: &str) -> Vec<Result<Delta, ProviderError>> {
     let value: Value = match serde_json::from_str(&event.data) {
         Ok(value) => value,
         Err(source) => {
-            return Some(Err(ProviderError::MalformedStream {
+            return vec![Err(ProviderError::MalformedStream {
                 name: name.to_string(),
                 reason: source.to_string(),
-            }));
+            })];
         }
     };
     if let Some(error) = value.get("error") {
-        return Some(Err(ProviderError::MalformedStream {
+        return vec![Err(ProviderError::MalformedStream {
             name: name.to_string(),
             reason: error.to_string(),
-        }));
+        })];
     }
-    let parts = value
-        .get("candidates")?
-        .get(0)?
-        .get("content")?
-        .get("parts")?
-        .as_array()?;
-    let text: String = parts
-        .iter()
-        .filter_map(|part| part.get("text")?.as_str())
-        .collect();
-    if text.is_empty() {
-        return None;
+    let Some(parts) = value
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    for part in parts {
+        let Some(part_text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if part
+            .get("thought")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            reasoning.push_str(part_text);
+        } else {
+            text.push_str(part_text);
+        }
     }
-    Some(Ok(Delta { text }))
+
+    let mut deltas = Vec::new();
+    if !reasoning.is_empty() {
+        deltas.push(Ok(Delta::Reasoning(reasoning)));
+    }
+    if !text.is_empty() {
+        deltas.push(Ok(Delta::Text(text)));
+    }
+    deltas
 }
 
 #[cfg(test)]
@@ -222,12 +250,8 @@ mod tests {
         assert_eq!(
             deltas,
             vec![
-                Delta {
-                    text: "Hel".to_string()
-                },
-                Delta {
-                    text: "lo!".to_string()
-                },
+                Delta::Text("Hel".to_string()),
+                Delta::Text("lo!".to_string()),
             ]
         );
     }
@@ -255,11 +279,39 @@ mod tests {
             .collect()
             .await;
 
+        assert_eq!(deltas, vec![Delta::Text("foo bar".to_string())]);
+    }
+
+    /// A single frame mixing a `thought: true` part with a regular part
+    /// must surface as two separate deltas, not one clobbering the other.
+    #[tokio::test]
+    async fn mixed_thought_and_text_parts_in_one_frame_both_survive() {
+        let server = MockServer::start().await;
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Thinking...\",\"thought\":true},{\"text\":\"Answer.\"}]}}]}\n\n";
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = GeminiProvider::new("default", &spec(server.uri()), "test-key".to_string());
+        let deltas: Vec<Delta> = provider
+            .stream(request(), CancellationToken::new())
+            .await
+            .unwrap()
+            .map(|d| d.unwrap())
+            .collect()
+            .await;
+
         assert_eq!(
             deltas,
-            vec![Delta {
-                text: "foo bar".to_string()
-            }]
+            vec![
+                Delta::Reasoning("Thinking...".to_string()),
+                Delta::Text("Answer.".to_string()),
+            ]
         );
     }
 
@@ -333,12 +385,7 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(
-            deltas,
-            vec![Delta {
-                text: "ok".to_string()
-            }]
-        );
+        assert_eq!(deltas, vec![Delta::Text("ok".to_string())]);
     }
 
     #[tokio::test]

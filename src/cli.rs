@@ -16,7 +16,8 @@ use crate::error::{CliError, StageError};
 use crate::provider::{self, AnyProvider, Message, Provider, Request, Role};
 use crate::stage::{self, Rigor, StageDefinition};
 use crate::tools::agent::{self, AgentObserver};
-use crate::tools::{self, ToolCall, ToolOutcome};
+use crate::tools::{self, Approver, ToolCall, ToolOutcome};
+use crate::tui::{self, app::App, app::TuiEvent};
 use crate::verify;
 use crate::workspace::{Store, Workspace};
 
@@ -64,6 +65,48 @@ pub enum Command {
     Build(BuildArgs),
     /// Revert the most recent tool-loop write (see `.delta/journal/`).
     Undo,
+    /// Watch a stage run or the tool loop through the interactive TUI
+    /// instead of plain stdout.
+    Tui {
+        #[command(subcommand)]
+        command: TuiCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum TuiCommand {
+    /// Run a stage through the TUI.
+    Run(TuiRunArgs),
+    /// Run the tool loop through the TUI.
+    Build(TuiBuildArgs),
+}
+
+#[derive(clap::Args)]
+pub struct TuiRunArgs {
+    /// Stage id to run, e.g. "proposal" or "design".
+    stage: String,
+    /// Change slug to run the stage for.
+    #[arg(long)]
+    change: String,
+    /// Provider name from `[providers.<name>]` in config. Defaults to "default".
+    #[arg(long)]
+    provider: Option<String>,
+    /// One-off rigor override for this run only; does not persist to the change.
+    #[arg(long)]
+    rigor: Option<Rigor>,
+}
+
+#[derive(clap::Args)]
+pub struct TuiBuildArgs {
+    /// Change slug whose proposal/design/tasks artifacts (whichever
+    /// exist) provide the agent's starting context.
+    change: String,
+    /// Provider name from `[providers.<name>]` in config. Defaults to "default".
+    #[arg(long)]
+    provider: Option<String>,
+    /// Hard cap on tool-call round-trips before stopping and reporting.
+    #[arg(long, default_value_t = agent::DEFAULT_MAX_ITERATIONS)]
+    max_iterations: u32,
 }
 
 #[derive(clap::Args)]
@@ -146,6 +189,10 @@ pub fn dispatch(command: &Command, repo_root: &Path, config: &Config) -> Result<
         Command::Verify(args) => cmd_verify(repo_root, args),
         Command::Build(args) => cmd_build(repo_root, config, args),
         Command::Undo => cmd_undo(repo_root),
+        Command::Tui { command } => match command {
+            TuiCommand::Run(args) => cmd_tui_run(repo_root, config, args),
+            TuiCommand::Build(args) => cmd_tui_build(repo_root, config, args),
+        },
     }
 }
 
@@ -406,6 +453,7 @@ fn cmd_build(repo_root: &Path, config: &Config, args: &BuildArgs) -> Result<(), 
         &tools::StdinApprover,
         args.max_iterations,
         &mut observer,
+        tokio_util::sync::CancellationToken::new(),
     ))?;
 
     println!();
@@ -413,6 +461,327 @@ fn cmd_build(repo_root: &Path, config: &Config, args: &BuildArgs) -> Result<(), 
         "note: tool loop finished after {} iteration(s)",
         outcome.iterations
     );
+    Ok(())
+}
+
+/// Forwards agent-loop callbacks into `TuiEvent`s instead of printing —
+/// the TUI-driving counterpart to `StreamingObserver`.
+struct TuiObserver {
+    tx: std::sync::mpsc::Sender<TuiEvent>,
+}
+
+impl AgentObserver for TuiObserver {
+    fn on_text_delta(&mut self, text: &str) {
+        let _ = self.tx.send(TuiEvent::Text(text.to_string()));
+    }
+
+    fn on_reasoning_delta(&mut self, text: &str) {
+        let _ = self.tx.send(TuiEvent::Reasoning(text.to_string()));
+    }
+
+    fn on_tool_call(&mut self, call: &ToolCall) {
+        let _ = self.tx.send(TuiEvent::ToolCall {
+            tool: call.tool.clone(),
+            input: call.input.to_string(),
+        });
+    }
+
+    fn on_tool_result(&mut self, outcome: &ToolOutcome) {
+        let _ = self.tx.send(TuiEvent::ToolResult {
+            success: outcome.success,
+            output: outcome.output.clone(),
+        });
+    }
+}
+
+/// Answers a `Prompt`-gated tool call by asking the TUI rather than
+/// reading stdin directly: while the TUI owns the terminal (raw mode +
+/// alternate screen) and polls the same file descriptor for key events
+/// on the main thread, a blocking `stdin().read_line()` from this
+/// background thread would race that polling loop for input. Sends an
+/// `ApprovalRequest` event and blocks on `answer_rx` for the reply,
+/// which `App::answer_approval` sends once the user presses y/n.
+struct TuiApprover {
+    event_tx: std::sync::mpsc::Sender<TuiEvent>,
+    answer_rx: std::sync::Mutex<std::sync::mpsc::Receiver<bool>>,
+}
+
+impl Approver for TuiApprover {
+    fn approve(&self, tool: &str, preview: &str) -> bool {
+        let _ = self.event_tx.send(TuiEvent::ApprovalRequest {
+            tool: tool.to_string(),
+            preview: preview.to_string(),
+        });
+        self.answer_rx
+            .lock()
+            .ok()
+            .and_then(|rx| rx.recv().ok())
+            .unwrap_or(false)
+    }
+}
+
+fn cmd_tui_run(repo_root: &Path, config: &Config, args: &TuiRunArgs) -> Result<(), CliError> {
+    let workspace = Workspace::discover(repo_root)?;
+    let stages = stage::load_all(workspace.store())?;
+    let stage_def =
+        stages
+            .iter()
+            .find(|s| s.id == args.stage)
+            .ok_or_else(|| StageError::NotFound {
+                id: args.stage.clone(),
+            })?;
+
+    let effective_rigor = match args.rigor {
+        Some(rigor) => rigor,
+        None => change::change_rigor(workspace.store(), &stages, &args.change)?,
+    };
+    if stage_def.min_rigor > effective_rigor {
+        write_not_applicable(workspace.store(), &stages, &args.change, stage_def)?;
+        println!(
+            "Skipped stage '{}' for change '{}': requires {} rigor, change is {} (n/a)",
+            stage_def.id, args.change, stage_def.min_rigor, effective_rigor
+        );
+        return Ok(());
+    }
+
+    let provider_name = args.provider.as_deref().unwrap_or("default");
+    let loaded_provider = provider::load(config, provider_name)?;
+    let assembled = stage::context::assemble(
+        workspace.store(),
+        repo_root,
+        stage_def,
+        &args.change,
+        &loaded_provider,
+    )?;
+    let context_window = loaded_provider.context_window();
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<TuiEvent>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<String, CliError>>();
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let _ = event_tx.send(TuiEvent::PromptInfo {
+        dropped: assembled.dropped.clone(),
+        context_window,
+    });
+    let _ = event_tx.send(TuiEvent::TokenCount(assembled.token_count));
+
+    let prompt = assembled.prompt;
+    let cancel_for_thread = cancel.clone();
+    let tx_for_thread = event_tx.clone();
+    let handle = std::thread::spawn(move || {
+        let result = (|| -> Result<String, CliError> {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(run_stage_streaming(
+                &loaded_provider,
+                &prompt,
+                cancel_for_thread,
+                tx_for_thread.clone(),
+            ))
+        })();
+        match &result {
+            Ok(_) => {
+                let _ = tx_for_thread.send(TuiEvent::Done);
+            }
+            Err(err) => {
+                let _ = tx_for_thread.send(TuiEvent::Error(err.to_string()));
+            }
+        }
+        let _ = result_tx.send(result);
+    });
+
+    let app = App::new(
+        args.change.clone(),
+        stage_def.id.clone(),
+        effective_rigor,
+        cancel,
+        None,
+    );
+    let outcome = tui::run(app, event_rx)?;
+    let _ = handle.join();
+
+    // A typed error from the background thread always wins — it carries
+    // the correct exit code, which `outcome.completed`/`outcome.error`
+    // (informational only, for when no typed error is available) can't.
+    let body = match result_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(body)) if outcome.completed => body,
+        Ok(Err(err)) => return Err(err),
+        _ => {
+            if let Some(err) = &outcome.error {
+                println!("note: {err}");
+            }
+            println!("Interrupted before completion; no artifact written.");
+            return Ok(());
+        }
+    };
+
+    let failures = stage::validate::validate(&stage_def.output, &body);
+    let status = if failures.is_empty() {
+        ArtifactStatus::Valid
+    } else {
+        ArtifactStatus::Failed
+    };
+    change::write_stage_artifact(
+        workspace.store(),
+        &stages,
+        &args.change,
+        change::StageWrite {
+            stage_id: &stage_def.id,
+            body: &body,
+            status,
+            rigor: None,
+            now: Utc::now(),
+        },
+    )?;
+
+    if !failures.is_empty() {
+        for failure in &failures {
+            eprintln!("  - {failure}");
+        }
+        return Err(StageError::ValidationFailed {
+            id: stage_def.id.clone(),
+            failures: failures.join("; "),
+        }
+        .into());
+    }
+
+    println!(
+        "Stage '{}' complete for change '{}'.",
+        stage_def.id, args.change
+    );
+    Ok(())
+}
+
+/// Like `run_stage`, but sends deltas as `TuiEvent`s over `tx` instead
+/// of printing directly — the TUI-driving counterpart to `run_stage`.
+async fn run_stage_streaming(
+    provider: &AnyProvider,
+    prompt: &str,
+    cancel: tokio_util::sync::CancellationToken,
+    tx: std::sync::mpsc::Sender<TuiEvent>,
+) -> Result<String, CliError> {
+    let request = Request {
+        system: None,
+        messages: vec![Message {
+            role: Role::User,
+            content: prompt.to_string(),
+        }],
+        max_tokens: RUN_MAX_TOKENS,
+    };
+    let mut stream = provider.stream(request, cancel).await?;
+    let mut body = String::new();
+    while let Some(delta) = stream.next().await {
+        match delta? {
+            provider::Delta::Text(text) => {
+                body.push_str(&text);
+                let _ = tx.send(TuiEvent::Text(text));
+                let _ = tx.send(TuiEvent::TokenCount(provider.count_tokens(&body)));
+            }
+            provider::Delta::Reasoning(text) => {
+                let _ = tx.send(TuiEvent::Reasoning(text));
+            }
+        }
+    }
+    Ok(body)
+}
+
+fn cmd_tui_build(repo_root: &Path, config: &Config, args: &TuiBuildArgs) -> Result<(), CliError> {
+    let workspace = Workspace::discover(repo_root)?;
+    if !change::list_changes(workspace.store())?
+        .iter()
+        .any(|slug| slug == &args.change)
+    {
+        return Err(crate::error::ChangeError::NotFound {
+            slug: args.change.clone(),
+        }
+        .into());
+    }
+
+    let (event_tx, event_rx) = std::sync::mpsc::channel::<TuiEvent>();
+    let (result_tx, result_rx) = std::sync::mpsc::channel::<Result<u32, CliError>>();
+    let (answer_tx, answer_rx) = std::sync::mpsc::channel::<bool>();
+    let cancel = tokio_util::sync::CancellationToken::new();
+
+    let repo_root_owned = repo_root.to_path_buf();
+    let config_owned = config.clone();
+    let slug = args.change.clone();
+    let provider_name = args
+        .provider
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let max_iterations = args.max_iterations;
+    let cancel_for_thread = cancel.clone();
+    let tx_for_thread = event_tx.clone();
+
+    let handle = std::thread::spawn(move || {
+        let result = (|| -> Result<u32, CliError> {
+            let workspace = Workspace::discover(&repo_root_owned)?;
+            let context = build_context(workspace.store(), &slug)?;
+            let agents_md =
+                std::fs::read_to_string(repo_root_owned.join("AGENTS.md")).unwrap_or_default();
+            let system_prompt = agent::build_system_prompt(&agents_md);
+            let initial_message = format!(
+                "Implement the change '{slug}' described below. Use the available tools to \
+                 read, search, and modify the repository as needed. When you are done, \
+                 respond with a final plain-text summary of what you did (no tool_call \
+                 block).\n\n{context}"
+            );
+
+            let loaded_provider = provider::load(&config_owned, &provider_name)?;
+            let approver = TuiApprover {
+                event_tx: tx_for_thread.clone(),
+                answer_rx: std::sync::Mutex::new(answer_rx),
+            };
+            let runtime = tokio::runtime::Runtime::new()?;
+            let mut observer = TuiObserver {
+                tx: tx_for_thread.clone(),
+            };
+            let outcome = runtime.block_on(agent::run_loop(
+                &loaded_provider,
+                system_prompt,
+                initial_message,
+                &repo_root_owned,
+                workspace.store(),
+                &config_owned,
+                &approver,
+                max_iterations,
+                &mut observer,
+                cancel_for_thread,
+            ))?;
+            Ok(outcome.iterations)
+        })();
+        match &result {
+            Ok(_) => {
+                let _ = tx_for_thread.send(TuiEvent::Done);
+            }
+            Err(err) => {
+                let _ = tx_for_thread.send(TuiEvent::Error(err.to_string()));
+            }
+        }
+        let _ = result_tx.send(result);
+    });
+
+    let app = App::new(
+        args.change.clone(),
+        "build".to_string(),
+        Rigor::Deep,
+        cancel,
+        Some(answer_tx),
+    );
+    let outcome = tui::run(app, event_rx)?;
+    let _ = handle.join();
+
+    match result_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(iterations)) if outcome.completed => {
+            println!("Tool loop finished after {iterations} iteration(s).");
+        }
+        Ok(Err(err)) => return Err(err),
+        _ => {
+            if let Some(err) = &outcome.error {
+                println!("note: {err}");
+            }
+            println!("Interrupted before completion.");
+        }
+    }
     Ok(())
 }
 
@@ -572,10 +941,20 @@ async fn run_stage(provider: &AnyProvider, prompt: &str) -> Result<String, CliEr
     let mut stream = provider.stream(request, cancel).await?;
     let mut body = String::new();
     while let Some(delta) = stream.next().await {
-        let delta = delta?;
-        print!("{}", delta.text);
-        std::io::stdout().flush().ok();
-        body.push_str(&delta.text);
+        // Reasoning never becomes part of the saved artifact — only
+        // visible text does. Printed dim to stderr so it doesn't
+        // pollute stdout if the caller pipes/redirects it.
+        match delta? {
+            provider::Delta::Text(text) => {
+                print!("{text}");
+                std::io::stdout().flush().ok();
+                body.push_str(&text);
+            }
+            provider::Delta::Reasoning(text) => {
+                eprint!("\x1b[2;3m{text}\x1b[0m");
+                std::io::stderr().flush().ok();
+            }
+        }
     }
     println!();
     Ok(body)

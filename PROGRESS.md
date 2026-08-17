@@ -853,3 +853,185 @@ user's live validation run, so it's fixed now rather than left for them to disco
 user's file to edit). Anyone who already ran `dlt init` before this fix landed needs to either
 delete `.delta` and re-init, or manually add a `{{ current }}` reference to their own
 `.delta/stages/*.yaml`, to pick this up.
+
+## Session 6 — Prompt 6 (TUI)
+
+The largest single prompt in the build, and the one `PLAN.md` names as a place "you must be
+present" for. Three design decisions were forced before any rendering code could be written; all
+three are documented in full below since they're real departures from a literal reading of the
+prompt text, not just implementation detail.
+
+**Decision 1 — `crossterm` isn't a direct dependency.** `PLAN.md`'s dependency table lists
+`crossterm` alongside `ratatui`. Adding it as a *separate* top-level dependency turned out to be
+actively wrong: `tui-textarea 0.7.0` (the newest published version) only supports `ratatui
+^0.29.0`, and `ratatui` re-exports its own `crossterm` at `ratatui::crossterm` specifically so
+consumers never end up with two differently-versioned, type-incompatible copies of the crate in
+the same binary. Adding `crossterm = "0.29.0"` directly, as the plan's table literally suggests,
+would have pulled in a *second*, incompatible `crossterm` alongside the one `ratatui`/`tui-textarea`
+already vendor — `KeyEvent` from one copy isn't the same type as `KeyEvent` from the other, so
+`tui_textarea::TextArea::input()` (which only accepts `ratatui::crossterm::event::Event` via its
+own crossterm dependency) would never accept events read via a separately-versioned crossterm.
+Fixed by pinning `ratatui = "0.29.0"` (the only version compatible with `tui-textarea`) and using
+`ratatui::crossterm::{event, terminal}` everywhere instead of a direct dependency — `crossterm`
+is still very much "added" and used pervasively, just via the re-export rather than its own
+Cargo.toml line. `unicode-width` needed the same treatment (pinned to `0.2.0` to match the
+version ratatui hard-pins) for the same reason.
+
+**Decision 2 — `Delta` gained a `Reasoning` variant, extending `provider.rs`/`provider/*.rs`.**
+"Collapsible dim-italic reasoning blocks" is an explicit, named requirement, but nothing in the
+provider layer distinguished a model's visible answer from its chain-of-thought — Anthropic's
+`thinking_delta` events were silently dropped, and no OpenAI-compatible or Gemini reasoning field
+was read at all. Rendering a fake "reasoning block" would have been dishonest UI; the actual fix
+was extending `Delta` from a plain-text struct into `enum Delta { Text(String), Reasoning(String)
+}` and wiring real reasoning-stream parsing in all three backends:
+- **Anthropic**: `content_block_delta` events with `delta.type == "thinking_delta"` (text lives
+  under `delta.thinking`, not `delta.text`).
+- **OpenAI-compatible**: the conventional `delta.reasoning_content` field several reasoning-model
+  servers stream (DeepSeek's API and others) alongside the standard `delta.content`.
+- **Gemini**: `parts[].thought == true` — and since a single frame's `parts` array can, in
+  principle, mix a thought part with a regular part in the same frame, `gemini.rs`'s `parse_event`
+  changed from `Option<Result<Delta, _>>` (via `filter_map`) to `Vec<Result<Delta, _>>` (via
+  `flat_map`) so both survive as separate deltas instead of one silently overwriting the other —
+  covered by `mixed_thought_and_text_parts_in_one_frame_both_survive`.
+
+This is a real, load-bearing correctness fix independent of the TUI: `cli.rs`'s plain `run_stage`
+and `tools::agent::run_loop` both now split on the variant — only `Delta::Text` accumulates into
+a stage's saved artifact body or the tool-call-parsing text; `Delta::Reasoning` never did before
+(there was nothing to leak), but if reasoning content had ever started flowing through, it would
+have silently polluted saved specs and confused the `tool_call` JSON-block parser. `run_stage`
+prints reasoning dim-italic to stderr on the plain CLI path too, not just inside the TUI.
+
+**Decision 3 — the TUI's tool-approval prompts don't read stdin.** Wiring `dlt tui build` to
+`agent::run_loop` surfaced a real concurrency bug before it shipped: `tools::StdinApprover` (from
+prompt 5) reads `stdin().read_line()` directly for its y/n prompt. If `dlt tui build` had reused
+it unchanged, that blocking stdin read on the background thread would race the TUI's own
+crossterm-based input polling on the *same file descriptor* from the *main* thread — both raw-mode
+input consumers fighting over one stream, with genuinely undefined UX (the render loop's
+non-blocking `poll()` and a blocking `read_line()` don't compose). Fixed with `TuiApprover`: it
+sends a `TuiEvent::ApprovalRequest { tool, preview }` down the same event channel every other
+piece of TUI output flows through, then blocks on a dedicated `mpsc::Receiver<bool>` for the
+answer. `App::approval_pending` renders a modal (`draw_approval` in `render.rs`) and takes strict
+priority over every other keystroke — `y`/`Y` approves, `n`/`N`/`esc` denies — answered via
+`App::answer_approval`, which sends down the corresponding `mpsc::Sender<bool>` `cli.rs` handed to
+both the `App` and the `TuiApprover` at construction. `dlt tui run` never needs this (no tools
+involved), so `App::new` takes `answer_tx: Option<mpsc::Sender<bool>>` — `None` for run-mode.
+
+Chasing this down also surfaced a second real bug in the same area: `agent::run_loop` created its
+*own* internal `CancellationToken` and never exposed a way to cancel it from outside — meaning
+`esc` in `dlt tui build` would never actually have interrupted an in-flight provider call, only
+looked like it did in the transcript. Fixed by adding a `cancel: CancellationToken` parameter to
+`run_loop` (threaded through unchanged to every `provider.stream(...)` call, same pattern
+`run_stage_streaming` already uses for `dlt tui run`); the plain-CLI `dlt build` path passes a
+fresh, never-cancelled token, since it has no interrupt mechanism of its own. Verified with
+`callers_cancellation_token_reaches_the_provider`, which required teaching the test suite's
+`FakeProvider` to actually check `cancel.is_cancelled()` — it hadn't needed to before.
+
+**Shipped:**
+- **Threading**: `tui.rs` (mod root) owns the terminal for the session's lifetime
+  (`ratatui::try_init()`/`ratatui::restore()`, which install/tear down raw mode, the alternate
+  screen, and a panic hook that restores the terminal before any panic unwinds) and runs a fixed
+  100ms-tick loop that never blocks: a non-blocking channel drain (`mpsc::TryRecvError::Empty`
+  breaks immediately), a zero-duration `crossterm::event::poll`, `App::on_tick`, then a dirty-gated
+  redraw. `cli.rs` spawns a plain `std::thread` with its own fresh `tokio::runtime::Runtime` to
+  drive the actual `Provider::stream`/`agent::run_loop` call, communicating **only** via
+  `std::sync::mpsc` channels (`TuiEvent` outbound, `bool` answers inbound for approvals, and a
+  separate one-shot-style channel carrying the background thread's final **typed** `Result<_,
+  CliError>` so exit codes stay correct — `tui::TuiOutcome`'s own `error: Option<String>` is
+  UI-facing/informational only, read as a fallback note when no typed result arrived in time, not
+  the exit-code source of truth). This is the literal, non-negotiable rule from `PLAN.md` — the
+  render loop never awaits, never touches `Provider`/`tools`, and the network/tool-execution
+  thread never touches the terminal.
+- **Layout**: header (change slug + stage + rigor + sprite + status word), a body that's one of
+  two panes — **Transcript** (text/reasoning/tool-call/tool-result/system/error entries, tail-fit
+  to the pane height since no scroll key is in `PLAN.md`'s key list) or **Info** (token count,
+  context window, what got dropped from context — the `--dry-run` detail, kept visible while the
+  TUI runs) — cycled with `tab`, and a sticky footer (elapsed `MM:SS`, token count, `esc to
+  interrupt`). Reasoning blocks are collapsible: collapsed by default to a one-line dim-italic
+  summary (`· reasoning (N chars) — /reasoning to expand`), expandable via the `/reasoning`
+  command (no dedicated hotkey — `PLAN.md`'s key list is `esc`/`ctrl-c`/`tab`/`/`/`?` exactly, so
+  "collapsible" is delivered through `/`, not an invented sixth key).
+- **Character**: `tui::sprite` — idle (waiting for the first token), working (streaming/acting),
+  done, each its own small braille/ASCII frame set, advanced at 10fps (`FRAME_INTERVAL =
+  100ms`) via `App::on_tick`'s frame-index bump. `App` starts `Idle` and only moves to `Working`
+  on the *first* real content event (`Text`/`Reasoning`/`ToolCall`/`ToolResult`) — genuinely idle
+  until the provider/tool loop produces something, not idle-in-name-only. Dirty-check: `App.dirty`
+  is only set when something observably changed (frame advance, status-word rotation, a new
+  transcript entry, a resize, or a key press); `tui.rs`'s loop only calls `terminal.draw(...)`
+  when it's set, then clears it.
+- **Status vocabulary** (`tui::status_words`): original word lists keyed to stage id, rotating
+  every 4s. Covers `PLAN.md`'s three literal pairs (proposal: interrogating/clarifying; design:
+  reconciling/weighing; build: patching/regressing — "build" here is `dlt build`'s tool loop, the
+  thing `PLAN.md`'s own word choice describes, not the `tasks` YAML stage) plus originals for
+  `tasks` and `verify`, with a generic fallback for anything else.
+- **Colour** (`tui::color`): two accent colours, `Color::Rgb` when `COLORTERM` is `truecolor` or
+  `24bit` (the de facto standard sniff every major terminal sets — kitty, Alacritty, iTerm2,
+  WezTerm, VS Code's integrated terminal, GNOME Terminal), falling back to the nearest
+  `Color::Indexed` 256-colour value otherwise.
+- **Keys**: `esc` interrupts (cancels the shared `CancellationToken`, marks the run cancelled —
+  distinct from `done`, see below); `ctrl-c` twice within 2s quits (a lone press arms a hint that
+  expires on its own after the window); `tab` cycles panes; `/` opens a `tui-textarea`-backed
+  command line (`reasoning`/`help`/`quit`); `?` toggles a help overlay. A pending tool-approval
+  request takes strict priority over all of the above — see decision 3.
+- **`App.cancelled`**: distinct from `App.done` (`done` is also `true` after a normal successful
+  finish). `true` only if the user interrupted a still-in-flight run (`esc`, or `ctrl-c` twice
+  before `Done`/`Error` arrived) — quitting *after* a normal finish never retroactively counts as
+  cancelled. `cli.rs` uses `TuiOutcome.completed` (`done && !cancelled && error.is_none()`) to
+  decide whether to write the stage artifact after the TUI closes.
+- **Launch surface** (not specified by `PLAN.md`, which describes the rendering experience, not a
+  command surface): `dlt tui run <stage> --change <slug>` and `dlt tui build <slug>`, each driving
+  exactly one operation live through the TUI — not a full in-TUI command shell that can launch new
+  stage runs from within itself, since nothing in the prompt text actually asks for that and it
+  would have meant a second, bidirectional command-orchestration channel on top of everything
+  above.
+- `error.rs`: `TuiError` is deliberately narrow — just `Io(#[from] std::io::Error)` for terminal
+  setup/teardown/draw/poll/read failures. Everything else (a `ProviderError`, a `StageError`, an
+  `AgentError`…) travels back to `cli.rs` through the typed result channel described above, never
+  through `TuiError` — `tui.rs` genuinely never needs to know those types exist.
+
+**Verified:**
+- `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean.
+- `cargo test` — 173 passing (165 unit including ~50 new across `tui::app`/`tui::render`/
+  `tui::sprite`/`tui::status_words`/`tui::color`, plus new `provider::{anthropic,openai_compatible,
+  gemini}` reasoning-delta tests and the `agent::run_loop` cancellation test; 8 `tests/cli.rs`
+  integration, unchanged). Confirmed green under both `--test-threads=1` and default parallelism.
+  `tui::render`'s tests use `ratatui::backend::TestBackend` + `Terminal::draw` and assert against
+  the rendered screen's text via `TestBackend`'s `Display` impl — no real terminal needed, and
+  this is genuinely how the header/footer/panes/overlays/reasoning-collapse were checked, not just
+  "does it compile."
+- `cargo build --target x86_64-unknown-linux-musl` still fully static (`file`/`ldd`) with
+  `ratatui`/`tui-textarea`/`textwrap`/`unicode-width` all in the tree — `cargo tree --edges normal`
+  shows no new `-sys` crates beyond the pre-existing `dirs-sys`/`inotify-sys` (`rustix`, which
+  `crossterm` needs on Linux via `ratatui`'s re-export, pulls in `linux-raw-sys`, but that's a
+  pure-Rust, libc-free raw-syscall binding crate with no `build.rs`/C compilation — same category
+  of "not what the no-C-deps rule is actually about" as `inotify-sys` was in prompt 4).
+- Manual smoke test of the built binary in a scratch git repo, covering everything reachable
+  without a real TTY (this sandbox has none, and there's no live-provider credential to drive an
+  actual streaming session either — consistent with every prior session's "no live API calls"
+  practice): `dlt tui --help`/`dlt tui run --help`/`dlt tui build --help` all render correctly;
+  `dlt tui build <nonexistent-slug>` → exit 2 before the terminal is ever touched; `dlt tui run
+  <bogus-stage> --change ...` → exit 2 (`StageError::NotFound`); `dlt tui run proposal --change
+  ...` with no provider configured → exit 2 (`ProviderError::NotConfigured`); with a provider
+  configured (dummy `base_url`/key, so it gets past config validation) → `ratatui::try_init()`
+  fails cleanly with `ENOTTY` (no controlling terminal in this sandbox), surfaced as
+  `TuiError::Io` → `CliError::Tui` → **exit 1**, clean message, no hang, no panic, nothing left in
+  a broken state (raw mode was never entered, so there was nothing to restore). This is the
+  strongest terminal-lifecycle validation possible without a real TTY; the actual interactive
+  behavior — key handling, animation, panes, overlays, the approval flow — is what the 50-odd new
+  `tui::*` unit/render tests exist to cover instead.
+
+**What comes after this (prompt 7 — Ship) should assume:**
+- The TUI's tool-call protocol is unchanged from prompt 5 (`` ```tool_call `` fenced JSON in plain
+  text) — `dlt tui build` renders it the same way `dlt build` executes it, no new wire format.
+- `provider.rs`'s `Delta` is now a two-variant enum; any future provider implementation (or any
+  cross-compile target's TLS/build verification) needs to keep both `Text`/`Reasoning` in mind,
+  though only Anthropic/OpenAI-compatible/Gemini exist today and all three are covered.
+- Every accent colour and the sprite/status-word content lives in `tui::color`/`tui::sprite`/
+  `tui::status_words` — if prompt 7's README wants a screenshot or a description of the TUI's
+  look, these three files are the ground truth, not something to re-derive.
+- `TuiRunArgs`/`TuiBuildArgs` don't expose `--dry-run` (unlike plain `dlt run`) — a live provider
+  is required to launch either TUI mode at all, matching that the TUI's whole point is watching a
+  real run happen.
+- No cross-compile verification has happened yet for the TUI specifically (raw mode / alternate
+  screen / crossterm behavior under Windows ConPTY vs. legacy console is explicitly prompt 7's
+  job, per `PLAN.md`'s "verify the Windows build under both ConPTY and legacy console") — this
+  session's musl build check confirms static linking, not terminal behavior on another platform.

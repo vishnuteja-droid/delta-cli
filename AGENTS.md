@@ -44,7 +44,11 @@ single static binary, single build path. Being built prompt-by-prompt from `PLAN
     `list_dir`/`search`/`run_command`) plus `tools::journal` (the write
     journal `dlt undo` reads) and `tools::agent` (the multi-turn tool
     loop driving `dlt build`)
-  - `tui` — render loop only; never makes network/provider calls itself
+  - `tui` — render loop only; never makes network/provider calls itself. `tui::app` is pure
+    state + transitions (testable without a terminal), `tui::render` is a pure `draw(frame,
+    app)` (testable via `ratatui::backend::TestBackend`), `tui::sprite`/`tui::status_words`/
+    `tui::color` are static lookup tables. `cli.rs` owns the background thread that drives
+    `Provider`/`tools::agent` and translates their output into `tui::app::TuiEvent`s
 - Reject `todo!()` scaffolding of future modules once past prompt 0. Code that compiles and
   does nothing reads as progress and isn't — a stub is a doc comment, not a placeholder
   function body.

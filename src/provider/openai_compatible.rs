@@ -1,6 +1,9 @@
 //! OpenAI-compatible provider: the Chat Completions streaming shape
 //! used by OpenAI itself, most local model servers (Ollama, llama.cpp),
-//! and most LLM gateways.
+//! and most LLM gateways. Reasoning-capable servers (DeepSeek's API,
+//! several local reasoning-model backends) stream a `reasoning_content`
+//! field on `delta` alongside the standard `content` field — surfaced
+//! as `Delta::Reasoning`, kept distinct from `Delta::Text`.
 
 use std::collections::BTreeMap;
 
@@ -117,7 +120,10 @@ impl Provider for OpenAiCompatible {
 /// Parse one SSE event from the Chat Completions stream. Returns `None`
 /// for events with no visible text (role-only chunks, `[DONE]`,
 /// finish-reason-only chunks) so the caller's `filter_map` skips them
-/// without ending the stream.
+/// without ending the stream. `content` is checked before
+/// `reasoning_content` — reasoning-capable servers send one or the
+/// other per chunk, never expected to send both at once, but if a
+/// server somehow did, visible text wins.
 fn parse_event(event: &Event, name: &str) -> Option<Result<Delta, ProviderError>> {
     if event.data == "[DONE]" {
         return None;
@@ -131,18 +137,18 @@ fn parse_event(event: &Event, name: &str) -> Option<Result<Delta, ProviderError>
             }));
         }
     };
-    let text = value
-        .get("choices")?
-        .get(0)?
-        .get("delta")?
-        .get("content")?
-        .as_str()?;
-    if text.is_empty() {
-        return None;
+    let delta = value.get("choices")?.get(0)?.get("delta")?;
+    if let Some(text) = delta.get("content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(Ok(Delta::Text(text.to_string())));
     }
-    Some(Ok(Delta {
-        text: text.to_string(),
-    }))
+    if let Some(text) = delta.get("reasoning_content").and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        return Some(Ok(Delta::Reasoning(text.to_string())));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -206,12 +212,47 @@ mod tests {
         assert_eq!(
             deltas,
             vec![
-                Delta {
-                    text: "Hel".to_string()
-                },
-                Delta {
-                    text: "lo!".to_string()
-                },
+                Delta::Text("Hel".to_string()),
+                Delta::Text("lo!".to_string()),
+            ]
+        );
+    }
+
+    /// `reasoning_content` must surface as `Delta::Reasoning`, distinct
+    /// from `content`'s `Delta::Text` — the DeepSeek-style reasoning
+    /// field some OpenAI-compatible servers stream.
+    #[tokio::test]
+    async fn reasoning_content_surfaces_as_reasoning_distinct_from_text() {
+        let server = MockServer::start().await;
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"Thinking...\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Answer.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(body, "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OpenAiCompatible::new("default", &spec(server.uri()), "sk-test".to_string());
+        let deltas: Vec<Delta> = provider
+            .stream(request(), CancellationToken::new())
+            .await
+            .unwrap()
+            .map(|d| d.unwrap())
+            .collect()
+            .await;
+
+        assert_eq!(
+            deltas,
+            vec![
+                Delta::Reasoning("Thinking...".to_string()),
+                Delta::Text("Answer.".to_string()),
             ]
         );
     }
@@ -272,12 +313,7 @@ mod tests {
             .collect()
             .await;
 
-        assert_eq!(
-            deltas,
-            vec![Delta {
-                text: "ok".to_string()
-            }]
-        );
+        assert_eq!(deltas, vec![Delta::Text("ok".to_string())]);
     }
 
     #[tokio::test]

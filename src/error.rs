@@ -129,6 +129,8 @@ pub enum CliError {
     Tool(#[from] ToolError),
     #[error(transparent)]
     Agent(#[from] AgentError),
+    #[error(transparent)]
+    Tui(#[from] TuiError),
 }
 
 impl CliError {
@@ -158,6 +160,7 @@ impl CliError {
             CliError::Agent(
                 AgentError::IterationCapReached { .. } | AgentError::TokenBudgetExceeded { .. },
             ) => 3,
+            CliError::Tui(TuiError::Io(_)) => 1,
         }
     }
 }
@@ -251,9 +254,16 @@ pub enum AgentError {
     TokenBudgetExceeded { tokens: u32, budget: u32 },
 }
 
+/// Failures owning the terminal itself: entering/leaving raw mode and
+/// the alternate screen, polling/reading input, drawing a frame. This
+/// is deliberately the *only* thing `TuiError` covers — a failure of
+/// the actual operation being watched (a `ProviderError`, a
+/// `StageError`, …) travels back to `cli.rs` through a separate typed
+/// result channel from the background thread that drives it, not
+/// through `tui.rs` at all, so `tui` never needs to know those types
+/// exist.
 #[derive(Debug, Error)]
-#[allow(dead_code)] // constructed once tui.rs gains real logic in prompt 6
 pub enum TuiError {
-    #[error("tui not yet implemented")]
-    Unimplemented,
+    #[error("terminal error: {0}")]
+    Io(#[from] std::io::Error),
 }

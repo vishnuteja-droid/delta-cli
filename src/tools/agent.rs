@@ -53,6 +53,7 @@ const TURN_MAX_TOKENS: u32 = 4_096;
 /// `verify::watch_and_rerun`'s callback established in prompt 4.
 pub trait AgentObserver {
     fn on_text_delta(&mut self, _text: &str) {}
+    fn on_reasoning_delta(&mut self, _text: &str) {}
     fn on_tool_call(&mut self, _call: &ToolCall) {}
     fn on_tool_result(&mut self, _outcome: &ToolOutcome) {}
 }
@@ -76,7 +77,11 @@ pub struct AgentOutcome {
 /// plain text (no tool call), the iteration cap is hit, or the running
 /// conversation would exceed the token budget. The last two stop and
 /// report via `AgentError`, never by silently truncating the
-/// conversation — the literal requirement from `PLAN.md`.
+/// conversation — the literal requirement from `PLAN.md`. `cancel` is
+/// handed to every `provider.stream(...)` call unchanged (cloned per
+/// turn) — the caller owns cancelling it, e.g. `dlt tui build`'s `esc`
+/// handler, or a fresh unused token for the plain-CLI path that never
+/// interrupts.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_loop(
     provider: &impl Provider,
@@ -88,8 +93,8 @@ pub async fn run_loop(
     approver: &dyn Approver,
     max_iterations: u32,
     observer: &mut dyn AgentObserver,
+    cancel: CancellationToken,
 ) -> Result<AgentOutcome, AgentError> {
-    let cancel = CancellationToken::new();
     let budget = provider
         .context_window()
         .saturating_sub(RESERVED_OUTPUT_TOKENS);
@@ -116,9 +121,18 @@ pub async fn run_loop(
         let mut stream = provider.stream(request, cancel.clone()).await?;
         let mut text = String::new();
         while let Some(delta) = stream.next().await {
-            let delta = delta?;
-            observer.on_text_delta(&delta.text);
-            text.push_str(&delta.text);
+            // Reasoning never enters the conversation transcript — it
+            // would otherwise pollute both the tool_call parse and the
+            // Assistant turn replayed back to the model next iteration.
+            match delta? {
+                crate::provider::Delta::Text(chunk) => {
+                    observer.on_text_delta(&chunk);
+                    text.push_str(&chunk);
+                }
+                crate::provider::Delta::Reasoning(chunk) => {
+                    observer.on_reasoning_delta(&chunk);
+                }
+            }
         }
         messages.push(Message {
             role: Role::Assistant,
@@ -275,11 +289,16 @@ mod tests {
         async fn stream(
             &self,
             _request: Request,
-            _cancel: CancellationToken,
+            cancel: CancellationToken,
         ) -> Result<
             BoxStream<'static, Result<Delta, crate::error::ProviderError>>,
             crate::error::ProviderError,
         > {
+            if cancel.is_cancelled() {
+                return Err(crate::error::ProviderError::Cancelled {
+                    name: "fake".to_string(),
+                });
+            }
             let text = self
                 .responses
                 .lock()
@@ -287,7 +306,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or("")
                 .to_string();
-            Ok(Box::pin(futures::stream::iter(vec![Ok(Delta { text })])))
+            Ok(Box::pin(futures::stream::iter(vec![Ok(Delta::Text(text))])))
         }
     }
 
@@ -362,6 +381,7 @@ mod tests {
             &AlwaysApprove,
             DEFAULT_MAX_ITERATIONS,
             &mut observer,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -390,6 +410,7 @@ mod tests {
             &AlwaysApprove,
             DEFAULT_MAX_ITERATIONS,
             &mut observer,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
@@ -420,6 +441,7 @@ mod tests {
             &AlwaysApprove,
             3,
             &mut observer,
+            CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -444,6 +466,7 @@ mod tests {
             &AlwaysApprove,
             DEFAULT_MAX_ITERATIONS,
             &mut observer,
+            CancellationToken::new(),
         )
         .await
         .unwrap_err();
@@ -468,9 +491,42 @@ mod tests {
             &AlwaysApprove,
             DEFAULT_MAX_ITERATIONS,
             &mut observer,
+            CancellationToken::new(),
         )
         .await
         .unwrap();
         assert_eq!(outcome.iterations, 2);
+    }
+
+    /// The caller's `cancel` token must actually reach every
+    /// `provider.stream(...)` call, not a fresh internal one the loop
+    /// creates for itself — otherwise nothing (e.g. `dlt tui build`'s
+    /// `esc` handler) could ever interrupt an in-flight turn.
+    #[tokio::test]
+    async fn callers_cancellation_token_reaches_the_provider() {
+        let (dir, store, config) = setup();
+        let provider = FakeProvider::scripted(&["irrelevant, cancelled before use"]);
+        let mut observer = NullObserver;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = run_loop(
+            &provider,
+            build_system_prompt(""),
+            "implement the change".to_string(),
+            dir.path(),
+            &store,
+            &config,
+            &AlwaysApprove,
+            DEFAULT_MAX_ITERATIONS,
+            &mut observer,
+            cancel,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::Provider(crate::error::ProviderError::Cancelled { .. })
+        ));
     }
 }
