@@ -15,6 +15,8 @@ use crate::config::Config;
 use crate::error::{CliError, StageError};
 use crate::provider::{self, AnyProvider, Message, Provider, Request, Role};
 use crate::stage::{self, Rigor, StageDefinition};
+use crate::tools::agent::{self, AgentObserver};
+use crate::tools::{self, ToolCall, ToolOutcome};
 use crate::verify;
 use crate::workspace::{Store, Workspace};
 
@@ -57,6 +59,24 @@ pub enum Command {
     Run(RunArgs),
     /// Run a change's acceptance-criteria checks.
     Verify(VerifyArgs),
+    /// Run the tool loop: let an agent read/write/patch/search the repo
+    /// and run commands to implement a change, gated by approval policy.
+    Build(BuildArgs),
+    /// Revert the most recent tool-loop write (see `.delta/journal/`).
+    Undo,
+}
+
+#[derive(clap::Args)]
+pub struct BuildArgs {
+    /// Change slug whose proposal/design/tasks artifacts (whichever
+    /// exist) provide the agent's starting context.
+    change: String,
+    /// Provider name from `[providers.<name>]` in config. Defaults to "default".
+    #[arg(long)]
+    provider: Option<String>,
+    /// Hard cap on tool-call round-trips before stopping and reporting.
+    #[arg(long, default_value_t = agent::DEFAULT_MAX_ITERATIONS)]
+    max_iterations: u32,
 }
 
 #[derive(clap::Args)]
@@ -114,6 +134,8 @@ pub fn dispatch(command: &Command, repo_root: &Path, config: &Config) -> Result<
         Command::Archive { slug, force } => cmd_archive(repo_root, slug, *force),
         Command::Run(args) => cmd_run(repo_root, config, args),
         Command::Verify(args) => cmd_verify(repo_root, args),
+        Command::Build(args) => cmd_build(repo_root, config, args),
+        Command::Undo => cmd_undo(repo_root),
     }
 }
 
@@ -277,6 +299,110 @@ fn run_verify_once(
         }
     }
     Ok((total, failed))
+}
+
+/// Build the agent's starting context from whichever of a change's
+/// proposal/design/tasks artifacts already exist. Not tied to the
+/// runtime stage graph the way `dlt run` is — the tool loop just wants
+/// whatever spec material is available, in the fixed order a reader
+/// would want it, not a stage-YAML-driven dependency walk.
+fn build_context(store: &dyn Store, slug: &str) -> Result<String, CliError> {
+    let mut context = String::new();
+    for stage_id in ["proposal", "design", "tasks"] {
+        if let Some(body) = change::read_artifact_body(store, slug, stage_id)? {
+            context.push_str(&format!("## {stage_id}\n\n{body}\n\n"));
+        }
+    }
+    if context.is_empty() {
+        context = format!("No proposal/design/tasks artifacts exist yet for change '{slug}'.");
+    }
+    Ok(context)
+}
+
+/// Prints tool-loop progress as it happens: text deltas stream straight
+/// to stdout (like `run_stage`'s completions do), tool calls/results go
+/// to stderr so stdout stays a clean transcript of the model's own words.
+#[derive(Default)]
+struct StreamingObserver;
+
+impl AgentObserver for StreamingObserver {
+    fn on_text_delta(&mut self, text: &str) {
+        print!("{text}");
+        std::io::stdout().flush().ok();
+    }
+
+    fn on_tool_call(&mut self, call: &ToolCall) {
+        eprintln!("\n--- tool call: {} {} ---", call.tool, call.input);
+    }
+
+    fn on_tool_result(&mut self, outcome: &ToolOutcome) {
+        eprintln!(
+            "--- tool result ({}) ---\n{}",
+            if outcome.success { "ok" } else { "failed" },
+            outcome.output
+        );
+    }
+}
+
+fn cmd_build(repo_root: &Path, config: &Config, args: &BuildArgs) -> Result<(), CliError> {
+    let workspace = Workspace::discover(repo_root)?;
+    if !change::list_changes(workspace.store())?
+        .iter()
+        .any(|slug| slug == &args.change)
+    {
+        return Err(crate::error::ChangeError::NotFound {
+            slug: args.change.clone(),
+        }
+        .into());
+    }
+
+    let context = build_context(workspace.store(), &args.change)?;
+    let agents_md = std::fs::read_to_string(repo_root.join("AGENTS.md")).unwrap_or_default();
+    let system_prompt = agent::build_system_prompt(&agents_md);
+    let initial_message = format!(
+        "Implement the change '{}' described below. Use the available tools to \
+         read, search, and modify the repository as needed. When you are done, \
+         respond with a final plain-text summary of what you did (no tool_call \
+         block).\n\n{context}",
+        args.change
+    );
+
+    let provider_name = args.provider.as_deref().unwrap_or("default");
+    let loaded_provider = provider::load(config, provider_name)?;
+    eprintln!(
+        "note: running the tool loop for change '{}' via provider '{}' (max {} iterations)",
+        args.change,
+        loaded_provider.name(),
+        args.max_iterations
+    );
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let mut observer = StreamingObserver;
+    let outcome = runtime.block_on(agent::run_loop(
+        &loaded_provider,
+        system_prompt,
+        initial_message,
+        repo_root,
+        workspace.store(),
+        config,
+        &tools::StdinApprover,
+        args.max_iterations,
+        &mut observer,
+    ))?;
+
+    println!();
+    eprintln!(
+        "note: tool loop finished after {} iteration(s)",
+        outcome.iterations
+    );
+    Ok(())
+}
+
+fn cmd_undo(repo_root: &Path) -> Result<(), CliError> {
+    let workspace = Workspace::discover(repo_root)?;
+    let reverted = tools::journal::undo_last(workspace.store(), repo_root)?;
+    println!("Reverted {}", reverted.display());
+    Ok(())
 }
 
 fn cmd_run(repo_root: &Path, config: &Config, args: &RunArgs) -> Result<(), CliError> {

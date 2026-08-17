@@ -6,6 +6,7 @@ mod config;
 mod error;
 mod provider;
 mod stage;
+mod tools;
 mod tui;
 mod verify;
 mod workspace;

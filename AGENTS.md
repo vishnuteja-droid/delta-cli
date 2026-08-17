@@ -40,6 +40,10 @@ single static binary, single build path. Being built prompt-by-prompt from `PLAN
   - `stage` — stage definitions, rigor classification, context assembly
   - `provider` — LLM streaming abstraction and implementations
   - `verify` — executable verification of acceptance criteria
+  - `tools` — gated tool execution (`read_file`/`write_file`/`apply_patch`/
+    `list_dir`/`search`/`run_command`) plus `tools::journal` (the write
+    journal `dlt undo` reads) and `tools::agent` (the multi-turn tool
+    loop driving `dlt build`)
   - `tui` — render loop only; never makes network/provider calls itself
 - Reject `todo!()` scaffolding of future modules once past prompt 0. Code that compiles and
   does nothing reads as progress and isn't — a stub is a doc comment, not a placeholder

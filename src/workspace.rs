@@ -13,6 +13,9 @@ pub const TRUTH_DIR: &str = "truth";
 pub const CHANGES_DIR: &str = "changes";
 pub const ARCHIVE_DIR: &str = "archive";
 pub const STAGES_DIR: &str = "stages";
+/// Where the tool loop (prompt 5) journals writes so `dlt undo` can
+/// revert the most recent one. See `tools::journal`.
+pub const JOURNAL_DIR: &str = "journal";
 
 /// Default stage definitions, seeded into `.delta/stages/` on `init` so
 /// a fresh workspace is immediately runnable. Once seeded, `stage.rs`
@@ -151,6 +154,7 @@ impl Workspace {
         store.create_dir_all(Path::new(CHANGES_DIR))?;
         store.create_dir_all(Path::new(ARCHIVE_DIR))?;
         store.create_dir_all(Path::new(STAGES_DIR))?;
+        store.create_dir_all(Path::new(JOURNAL_DIR))?;
         for (filename, contents) in DEFAULT_STAGES {
             store.write_string(&Path::new(STAGES_DIR).join(filename), contents)?;
         }
@@ -188,6 +192,7 @@ mod tests {
         assert!(workspace.store().exists(Path::new(TRUTH_DIR)));
         assert!(workspace.store().exists(Path::new(CHANGES_DIR)));
         assert!(workspace.store().exists(Path::new(ARCHIVE_DIR)));
+        assert!(workspace.store().exists(Path::new(JOURNAL_DIR)));
     }
 
     #[test]

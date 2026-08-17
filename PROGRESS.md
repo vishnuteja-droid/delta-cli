@@ -558,3 +558,178 @@ with all three new deps in the tree: still `static-pie linked, statically linked
   a condition that isn't a Rust `Err` anywhere else in the call chain; prompt 5's approval-gate
   denials (`auto`/`prompt`/`deny`) may want the same shape rather than inventing a new error
   variant per tool that doesn't wrap a real failure.
+
+## Session 5 — Prompt 5 (tool loop)
+
+**The one real design decision this session, made up front and worth reading before anything
+else below:** `PLAN.md`'s dependency table for this prompt lists only `similar`, `ignore`,
+`grep-searcher` — no provider- or SSE-related crate — even though "tool results feed back into
+the loop" clearly describes a real multi-turn, model-driven agent loop. Native function-calling
+(Anthropic's `tool_use` content blocks, OpenAI's `tool_calls`) would have meant adding streaming
+partial-JSON-argument accumulation to **both** `provider/anthropic.rs` and
+`provider/openai_compatible.rs` — a real protocol difference between the two vendors — for a tool
+that explicitly targets arbitrary `openai_compatible` backends including "most local servers,"
+many of which don't implement either vendor's native tool-calling wire format at all. Instead,
+`tools::agent` asks the model to express a tool call as a fenced `` ```tool_call `` code block
+containing `{"tool": "...", "input": {...}}` inside its ordinary streamed text, and to respond
+with plain prose (no such block) once it has a final answer. This works identically against
+every backend `Provider` already supports and needed **zero changes** to `provider.rs` —
+`Request`/`Message`/`Role`/`Delta` are exactly what prompt 3 left them; `Role::Assistant`, marked
+"not yet constructed anywhere" back in prompt 2, is now genuinely used to hold each turn's full
+text in the growing conversation. If a live model proves unreliable at this convention in
+practice, the fallback would be exactly the native-tool-calling extension described above — the
+loop's public shape (`run_loop`, `AgentObserver`, `ToolCall`/`ToolOutcome`) wouldn't need to
+change, only `parse_tool_call`'s extraction and how the request is built.
+
+**Shipped:**
+
+- `tools.rs` (module root): the six gated tools `read_file`, `write_file`, `apply_patch`,
+  `list_dir`, `search`, `run_command`, each behind a per-tool `Approval` (`auto`/`prompt`/`deny`)
+  read from `[tools.<name>].policy` in config — falling back to `auto` for the three read-only
+  tools and `prompt` for the three that mutate/execute (the literal "writes and commands default
+  to prompt" requirement). `execute()` is the single dispatch entry point; a denied/declined/
+  malformed-input call comes back as a **failing `ToolOutcome`**, not an `Err` — the agent loop
+  always gets something concrete to react to and keep going, the same "malformed input becomes a
+  visible failure, not a silent drop or a crash" pattern `verify.rs` established for its check
+  DSL. `Approver` is a trait (`StdinApprover` prints the diff/command to stderr and reads y/n from
+  stdin; tests use fakes) — the same "abstract the effectful boundary" move as `Store`/`Provider`.
+  `run_command` never runs through a shell (`Command::new(program).args(args)` directly, no
+  `sh -c`), checks its `[tools.run_command].allowlist` **before** the approval gate (so an
+  unlisted program is never even prompted for), and reuses prompt 4's spawn/timeout/kill-process-
+  group technique from `verify.rs`'s `run_cmd` (own process group via `CommandExt::process_group`,
+  a channel + `recv_timeout`, `kill -9 -<pid>` / `taskkill /T /F` on timeout) minus the shell
+  wrapping, which `run_command` must never use.
+- `tools/apply_patch.rs`: unified-diff hunk parsing (`@@ -l,s +l,s @@`, tolerating leading
+  `--- a/...`/`+++ b/...` headers and `\ No newline at end of file` markers, since the caller
+  already knows the target path — only the hunks matter) plus **fuzzy context matching**, the
+  prompt's own "hardest correctness problem" call-out. Each hunk's context+removed lines are
+  located in the file by content, not trusted line numbers: an expanding-ring search starting at
+  the hunk's declared line and walking outward, exact match first, then a trailing-whitespace-
+  tolerant fallback. Hunks apply in order against the progressively-patched buffer (not the
+  original), so later hunks correctly find content shifted by earlier ones. The replacement is
+  assembled from the **actually-matched file lines** for context positions and the hunk's literal
+  text only for genuine additions — this survived a real bug (see below) and matters because it's
+  what keeps a fuzzy-matched but otherwise-unchanged line's incidental whitespace/CRLF from being
+  silently clobbered by the patch author's own rendering of that same line. `str::lines()` already
+  normalizes `\r\n` vs `\n` on both the file and the patch text, so CRLF tolerance falls out of the
+  parsing for free; the file's original line-ending convention and trailing-newline-or-not are
+  detected once and preserved on write. Explicitly tested against every scenario `PLAN.md` names —
+  reordered/drifted context, trailing whitespace, CRLF, and overlapping hunks — plus insertion-only
+  hunks, new-file creation, a clear `hunk not found` error, and header-line tolerance.
+- `tools/search.rs`: `ignore::WalkBuilder` (with `require_git(false)` — `.gitignore` should apply
+  because it's declared, not only inside an actual `.git` checkout) walking into `grep-searcher` +
+  `grep-regex::RegexMatcher`, capped at `MAX_MATCHES` (200) so an unanchored pattern over a big
+  repo can't blow the loop's token budget on its own. `grep-regex`/`grep-matcher` aren't in
+  `PLAN.md`'s literal dependency list (only `grep-searcher` is) but are required to construct a
+  `Matcher` at all — the same kind of gap-filling the `git changed` syntax invention was in prompt
+  4, added and documented rather than blocking on it.
+- `tools/journal.rs`: one JSON file per write under `.delta/journal/`, filename a zero-padded
+  sequence number derived from the directory's *current* entry count (self-correcting after an
+  undo removes an entry — see the module doc comment for why this can't collide). `undo_last`
+  restores the target file's previous content, or deletes it if the write created a new file
+  (`previous_content: Option<String>`, `None` = didn't exist before), and moves the consumed entry
+  to a **sibling** `journal-undone/` directory (not nested inside `journal/`, so it's never counted
+  when the next entry's filename is chosen) rather than deleting it — "reverted," not "erased,"
+  matching the project's established archive-not-delete instinct. Only `write_file`/`apply_patch`
+  are journalled; `run_command`'s effects aren't file mutations this module owns and generally
+  aren't reversible at all — `PLAN.md` says "every **write** is journalled," not every tool call.
+- `tools/agent.rs`: `run_loop` — the multi-turn conversation described above. Before every
+  provider call it sums `count_tokens` over the system prompt and the whole running conversation
+  against `provider.context_window() - RESERVED_OUTPUT_TOKENS`; over budget stops with
+  `AgentError::TokenBudgetExceeded` rather than truncating anything, the literal requirement.
+  After `max_iterations` turns without a plain-text final answer, stops with
+  `AgentError::IterationCapReached`. A malformed `tool_call` block is fed back to the model as a
+  parse-error message (one more turn, still counted against the cap) rather than aborting the
+  whole loop. `AgentObserver` (default no-op methods, three callbacks: text delta, tool call, tool
+  result) keeps this module UI-agnostic — `cli.rs`'s `StreamingObserver` prints text live to
+  stdout and tool calls/results to stderr, the same callback-based seam `verify::watch_and_rerun`
+  established in prompt 4 for keeping a module out of the UI-printing business. Tested via a
+  `FakeProvider` (a scripted `VecDeque<&str>` of turn responses) rather than `wiremock` — this
+  loop's logic is entirely in how it reacts to already-parsed text, not in HTTP/SSE framing, so a
+  fake at the `Provider` trait boundary is the right layer, not another mock HTTP server.
+- `dlt build <change> [--provider NAME] [--max-iterations N]`: assembles the initial context from
+  whichever of the change's `proposal`/`design`/`tasks` artifacts already exist (concatenated in
+  that fixed order — not stage-YAML-driven the way `dlt run`'s context assembly is, since the tool
+  loop just wants whatever spec material exists, not a dependency walk) plus `AGENTS.md`, and
+  drives `tools::agent::run_loop` with `StdinApprover` and the real loaded provider.
+- `dlt undo`: reverts the single most-recent journalled write via `tools::journal::undo_last`.
+- `error.rs`: `ToolError` (six tool's + the journal's internal-failure variants — a tool
+  *reporting* failure to the model is a `ToolOutcome`, never this type) and `AgentError`
+  (wraps `ProviderError`/`ChangeError`/`ToolError`/`Workspace`, plus the two loop-specific
+  variants). `CliError` gained `Tool`/`Agent`; `IterationCapReached`/`TokenBudgetExceeded` map to
+  exit code **3** (the established "gate not satisfied" precedent from prompt 3's rigor gate and
+  the validation-failure shape). Extracted `provider_exit_code`/`tool_exit_code` helpers so
+  `CliError::Provider` and `CliError::Agent(AgentError::Provider(_))` (etc.) share one mapping
+  instead of duplicating the match arms.
+- `workspace.rs`: `JOURNAL_DIR` constant, seeded (`create_dir_all`) alongside `truth/`/`changes/`/
+  `archive/`/`stages/` on `init`.
+
+**Fixed during this session (real bugs, not just test artifacts, caught by the apply_patch/search
+test suite itself before anything shipped):**
+
+- Pure-insertion hunks (`old_start` with a zero-length old range, e.g. `@@ -2,0 +3,1 @@`) were
+  inserting one line too early — off-by-one against unified diff's own convention, where a
+  zero-length old range's start line means "insert **after** this original line," not
+  "old_start - 1" the way a real (non-empty) range's start does. Fixed by using `old_start`
+  directly (clamped to the file's length) as the insertion index for this case only.
+- The original `apply_hunk` built its replacement purely from the hunk's own literal text for both
+  context and added lines. Combined with the whitespace-tolerant fuzzy match pass, this meant a
+  context line matched *despite* a trailing-whitespace difference would still get overwritten with
+  the hunk's (whitespace-stripped) version — silently deleting real trailing whitespace the patch
+  never intended to touch. Fixed by rebuilding the replacement from the **actually-matched file
+  lines** for context positions, using the hunk's literal text only for genuine `+` additions.
+- `tools::search`'s `.gitignore` handling: `ignore::WalkBuilder` defaults to `require_git(true)`,
+  meaning `.gitignore` files are only honored when the target directory is actually inside a
+  `.git` checkout — a temp-dir test (and, in principle, any repo tree `dlt` is pointed at before
+  `git init`) silently ignored `.gitignore` entirely. Fixed with `.require_git(false)`.
+
+**Verified:**
+
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo test` — 117 passing (110 unit including 63 new across `tools`/`tools::apply_patch`/
+  `tools::journal`/`tools::search`/`tools::agent`; 7 `tests/cli.rs` integration, unchanged). Green
+  under both `--test-threads=1` and default parallelism.
+- `cargo fmt --check` clean.
+- `cargo build --target x86_64-unknown-linux-musl` clean; `file`/`ldd` confirm the binary is still
+  fully static (`static-pie linked, statically linked`) with `similar`/`ignore`/`grep-searcher`/
+  `grep-regex`/`grep-matcher` all in the tree — no new `-sys` crates beyond the pre-existing
+  `dirs-sys`/`inotify-sys`, confirmed via `cargo tree --edges normal`.
+- Manual smoke test of the built binary in a scratch git repo, covering everything reachable
+  without live provider credentials (the loop itself is exercised by the `FakeProvider` unit
+  tests above, consistent with prompt 2's "no live API calls in the test suite" precedent): `dlt
+  undo` with an empty journal → exit 2, clear message; `dlt build <nonexistent-slug>` → exit 2
+  (`ChangeError::NotFound`, checked explicitly before the provider is even loaded); `dlt build
+  <real-slug>` with no `[providers.default]` configured → exit 2 (`ProviderError::NotConfigured`);
+  `dlt --help` lists `build` and `undo` with their doc-comment descriptions. The tool substrate
+  itself (approval gates, journal write/undo, `apply_patch`'s fuzzy matching against drift/
+  whitespace/CRLF/overlapping hunks, the allowlist gate on `run_command`) is covered end-to-end by
+  the unit test suite against real temporary filesystems, not just mocked.
+
+**What prompt 6 should assume:**
+
+- The tool-call protocol is text-embedded JSON in a fenced `` ```tool_call `` block, parsed by
+  `tools::agent::parse_tool_call` out of the model's plain streamed text — **not** either vendor's
+  native function-calling wire format. `provider.rs`/`provider/anthropic.rs`/
+  `provider/openai_compatible.rs` are byte-for-byte unchanged from prompt 3. If the TUI wants to
+  render tool calls/results distinctly from prose (likely, for a good UX), it should render off
+  `AgentObserver`'s three callbacks (`on_text_delta`/`on_tool_call`/`on_tool_result`) rather than
+  re-parsing `` ```tool_call `` blocks itself — `cli.rs`'s `StreamingObserver` is the reference
+  implementation of "something that reacts to these callbacks," and the TUI needs the same seam
+  with a different renderer, exactly like `verify::watch_and_rerun`'s callback was reused as a
+  reference pattern last session.
+- `tools::execute`/`ToolCall`/`ToolOutcome`/`Approver` are the load-bearing public surface if a
+  future prompt wants to invoke a single tool outside the full agent loop (e.g. a TUI keybinding
+  that runs `search` directly) — call `tools::execute` the same way `tools::agent::run_loop` does,
+  don't reimplement approval-gate/journal logic at a new call site.
+- `AgentOutcome.final_answer` exists but nothing in `cli.rs` reads it today (the text was already
+  streamed live via `on_text_delta`); it's there for a future non-streaming caller or the TUI,
+  which may want the accumulated final text without re-deriving it from callbacks.
+- The journal only records `write_file`/`apply_patch`; `dlt undo` cannot revert a `run_command`
+  call's side effects (a test suite run, a build, anything a command actually did to the
+  filesystem or beyond). This is a deliberate scope reading of "every **write** is journalled,"
+  not an oversight — worth flagging to a user, but not something prompt 6 needs to fix.
+- `[tools.<name>].policy` and `[tools.run_command].allowlist` are the two new config surfaces this
+  session added; neither has a default value written into `config.rs`'s `Config::defaults()` (the
+  policy fallback lives in `tools::default_policy`, the allowlist's absence just means "nothing
+  runnable" by design) — if prompt 6's TUI exposes a settings/config view, these are real,
+  user-facing knobs worth surfacing, not just internal wiring.

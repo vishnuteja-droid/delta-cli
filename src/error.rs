@@ -125,6 +125,10 @@ pub enum CliError {
     Verify(#[from] VerifyError),
     #[error("verification failed: {failed} of {total} acceptance criteria did not pass")]
     ChecksFailed { failed: usize, total: usize },
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+    #[error(transparent)]
+    Agent(#[from] AgentError),
 }
 
 impl CliError {
@@ -138,19 +142,22 @@ impl CliError {
             CliError::Stage(StageError::Workspace(WorkspaceError::Io { .. })) => 1,
             CliError::Stage(StageError::Change(err)) => change_exit_code(err),
             CliError::Stage(_) => 2,
-            CliError::Provider(
-                ProviderError::Request { .. }
-                | ProviderError::Http { .. }
-                | ProviderError::MalformedStream { .. }
-                | ProviderError::Cancelled { .. },
-            ) => 1,
-            CliError::Provider(_) => 2,
+            CliError::Provider(err) => provider_exit_code(err),
             CliError::Runtime(_) => 1,
             CliError::Verify(VerifyError::Workspace(WorkspaceError::Io { .. })) => 1,
             CliError::Verify(VerifyError::Workspace(_)) => 2,
             CliError::Verify(VerifyError::Change(err)) => change_exit_code(err),
             CliError::Verify(VerifyError::Watch { .. }) => 1,
             CliError::ChecksFailed { .. } => 2,
+            CliError::Tool(err) => tool_exit_code(err),
+            CliError::Agent(AgentError::Workspace(WorkspaceError::Io { .. })) => 1,
+            CliError::Agent(AgentError::Workspace(_)) => 2,
+            CliError::Agent(AgentError::Change(err)) => change_exit_code(err),
+            CliError::Agent(AgentError::Provider(err)) => provider_exit_code(err),
+            CliError::Agent(AgentError::Tool(err)) => tool_exit_code(err),
+            CliError::Agent(
+                AgentError::IterationCapReached { .. } | AgentError::TokenBudgetExceeded { .. },
+            ) => 3,
         }
     }
 }
@@ -160,6 +167,26 @@ fn change_exit_code(err: &ChangeError) -> u8 {
         ChangeError::Workspace(WorkspaceError::Io { .. }) => 1,
         ChangeError::Stale { .. } => 4,
         _ => 2,
+    }
+}
+
+fn provider_exit_code(err: &ProviderError) -> u8 {
+    match err {
+        ProviderError::Request { .. }
+        | ProviderError::Http { .. }
+        | ProviderError::MalformedStream { .. }
+        | ProviderError::Cancelled { .. } => 1,
+        _ => 2,
+    }
+}
+
+fn tool_exit_code(err: &ToolError) -> u8 {
+    match err {
+        ToolError::Workspace(WorkspaceError::Io { .. }) => 1,
+        ToolError::Workspace(_) => 2,
+        ToolError::JournalEmpty => 2,
+        ToolError::Io { .. } => 1,
+        ToolError::Patch(_) | ToolError::Search(_) | ToolError::Journal(_) => 1,
     }
 }
 
@@ -173,6 +200,55 @@ pub enum VerifyError {
     Change(#[from] ChangeError),
     #[error("failed to watch {path} for changes: {reason}")]
     Watch { path: String, reason: String },
+}
+
+/// Tool-loop execution: the six gated tools (`read_file`, `write_file`,
+/// `apply_patch`, `list_dir`, `search`, `run_command`) plus the write
+/// journal `dlt undo` reads. A tool *reporting* failure back to the
+/// model — file not found, a command exiting non-zero, a patch whose
+/// context can't be located — is not this error type; that's carried as
+/// a failing `tools::ToolOutcome` so the agent loop can react and keep
+/// going. These variants are for failures the loop can't recover from.
+#[derive(Debug, Error)]
+pub enum ToolError {
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error("failed to access {path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to apply patch: {0}")]
+    Patch(String),
+    #[error("search failed: {0}")]
+    Search(String),
+    #[error("journal error: {0}")]
+    Journal(String),
+    #[error("no journal entries to undo")]
+    JournalEmpty,
+}
+
+/// The tool loop (`tools::agent`, driving `dlt build`): a multi-turn
+/// conversation between a provider and the tool executor, capped by
+/// iteration count and token budget so a runaway loop stops and reports
+/// rather than running forever or silently truncating its own context.
+#[derive(Debug, Error)]
+pub enum AgentError {
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
+    #[error(transparent)]
+    Provider(#[from] ProviderError),
+    #[error(transparent)]
+    Tool(#[from] ToolError),
+    #[error("reached the iteration cap ({cap}) without a final answer")]
+    IterationCapReached { cap: u32 },
+    #[error(
+        "token budget exceeded: the conversation is {tokens} tokens against a budget of {budget}"
+    )]
+    TokenBudgetExceeded { tokens: u32, budget: u32 },
 }
 
 #[derive(Debug, Error)]
