@@ -4,6 +4,7 @@
 
 use std::io::Write as _;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::Utc;
 use clap::{Parser, Subcommand};
@@ -14,6 +15,7 @@ use crate::config::Config;
 use crate::error::{CliError, StageError};
 use crate::provider::{self, AnyProvider, Message, Provider, Request, Role};
 use crate::stage::{self, Rigor, StageDefinition};
+use crate::verify;
 use crate::workspace::{Store, Workspace};
 
 /// Tokens requested for a stage's completion. Mirrors the budget
@@ -43,10 +45,30 @@ pub enum Command {
     /// Show the status of all in-flight changes.
     Status,
     /// Apply a change's deltas to truth and move it to .delta/archive/.
-    Archive { slug: String },
+    Archive {
+        slug: String,
+        /// Archive even if acceptance-criteria checks are failing.
+        /// Recorded on the archived artifacts' frontmatter.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run a stage: assemble its prompt, call the provider, validate and
     /// write the resulting artifact.
     Run(RunArgs),
+    /// Run a change's acceptance-criteria checks.
+    Verify(VerifyArgs),
+}
+
+#[derive(clap::Args)]
+pub struct VerifyArgs {
+    /// Change slug to verify. Omit to verify every in-flight change.
+    slug: Option<String>,
+    /// Rerun on file changes instead of exiting after one pass.
+    #[arg(long)]
+    watch: bool,
+    /// Per-check timeout, in seconds.
+    #[arg(long, default_value_t = verify::DEFAULT_TIMEOUT_SECS)]
+    timeout: u64,
 }
 
 #[derive(clap::Args)]
@@ -89,8 +111,9 @@ pub fn dispatch(command: &Command, repo_root: &Path, config: &Config) -> Result<
             ChangeCommand::List => cmd_change_list(repo_root),
         },
         Command::Status => cmd_status(repo_root),
-        Command::Archive { slug } => cmd_archive(repo_root, slug),
+        Command::Archive { slug, force } => cmd_archive(repo_root, slug, *force),
         Command::Run(args) => cmd_run(repo_root, config, args),
+        Command::Verify(args) => cmd_verify(repo_root, args),
     }
 }
 
@@ -150,12 +173,110 @@ fn cmd_status(repo_root: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn cmd_archive(repo_root: &Path, slug: &str) -> Result<(), CliError> {
+fn cmd_archive(repo_root: &Path, slug: &str, force: bool) -> Result<(), CliError> {
     let workspace = Workspace::discover(repo_root)?;
     let stages = stage::load_all(workspace.store())?;
+
+    let timeout = Duration::from_secs(verify::DEFAULT_TIMEOUT_SECS);
+    let results = verify::verify_change(workspace.store(), repo_root, slug, &stages, timeout)?;
+    let failed: Vec<&verify::CriterionResult> = results.iter().filter(|r| !r.passed).collect();
+    if !failed.is_empty() {
+        for result in &failed {
+            eprintln!("  [FAIL] {}", result.description);
+        }
+        if !force {
+            return Err(CliError::ChecksFailed {
+                failed: failed.len(),
+                total: results.len(),
+            });
+        }
+        change::mark_verify_forced(workspace.store(), slug)?;
+        eprintln!(
+            "note: archiving with {} failing check(s), forced via --force",
+            failed.len()
+        );
+    }
+
     change::archive_change(workspace.store(), slug, &stages)?;
     println!("Archived change '{slug}'");
     Ok(())
+}
+
+fn cmd_verify(repo_root: &Path, args: &VerifyArgs) -> Result<(), CliError> {
+    let workspace = Workspace::discover(repo_root)?;
+    let stages = stage::load_all(workspace.store())?;
+    let timeout = Duration::from_secs(args.timeout);
+
+    if args.watch {
+        verify::watch_and_rerun(repo_root, || {
+            match run_verify_once(
+                &workspace,
+                repo_root,
+                &stages,
+                args.slug.as_deref(),
+                timeout,
+            ) {
+                Ok((total, failed)) => println!(
+                    "\n{} checked, {failed} failing ({} passing)",
+                    total,
+                    total - failed
+                ),
+                Err(err) => eprintln!("error: {err}"),
+            }
+        })?;
+        return Ok(());
+    }
+
+    let (total, failed) = run_verify_once(
+        &workspace,
+        repo_root,
+        &stages,
+        args.slug.as_deref(),
+        timeout,
+    )?;
+    if failed > 0 {
+        return Err(CliError::ChecksFailed { failed, total });
+    }
+    Ok(())
+}
+
+/// Run every check for `slug` (or every in-flight change if `None`),
+/// printing pass/fail per criterion, and return `(total, failed)`.
+fn run_verify_once(
+    workspace: &Workspace,
+    repo_root: &Path,
+    stages: &[StageDefinition],
+    slug: Option<&str>,
+    timeout: Duration,
+) -> Result<(usize, usize), CliError> {
+    let slugs: Vec<String> = match slug {
+        Some(s) => vec![s.to_string()],
+        None => change::list_changes(workspace.store())?,
+    };
+
+    let mut total = 0;
+    let mut failed = 0;
+    for slug in &slugs {
+        let results = verify::verify_change(workspace.store(), repo_root, slug, stages, timeout)?;
+        if results.is_empty() {
+            println!("{slug}: no acceptance criteria with `verify:` checks found");
+            continue;
+        }
+        println!("{slug}:");
+        for result in &results {
+            total += 1;
+            if result.passed {
+                println!("  [pass] {}", result.description);
+            } else {
+                failed += 1;
+                println!("  [FAIL] {}", result.description);
+                for line in result.detail.lines() {
+                    println!("         {line}");
+                }
+            }
+        }
+    }
+    Ok((total, failed))
 }
 
 fn cmd_run(repo_root: &Path, config: &Config, args: &RunArgs) -> Result<(), CliError> {

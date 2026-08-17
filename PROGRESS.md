@@ -429,3 +429,132 @@ prompt 2's scope but a real bug):**
   produces (`VerifyError` is still the prompt-0 `Unimplemented` stub) — exit code 3 is now
   precedented (validation-failure shape), but prompt 4 should decide for itself whether
   verification failures reuse it or need their own code.
+
+## Session 4 — Prompt 4 (verification engine)
+
+**Shipped:**
+
+- `verify.rs`: the product, per `PLAN.md`'s own framing. Parses `## Acceptance Criteria`
+  checklists out of **any** of a change's existing artifacts (not tied to a specific stage —
+  stage schemas are user-authorable data since prompt 3, so the engine doesn't hardcode where
+  criteria live). A checklist item (`- [ ] ...`) only becomes an executable `Criterion` if
+  followed by a line that is *only* an inline code span `` `verify: <check>` ``; plain items
+  with no such annotation are left for a human and silently skipped, not reported. A malformed
+  `verify:` spec still becomes a criterion — a **failing** one, with the parse error as its
+  detail — so a typo in a check is visible rather than silently ignored.
+  - Three check kinds, hand-tokenized (quote-aware, no regex needed for the DSL itself):
+    `cmd "<command>" [expect exit <n>] [contains "<text>"] [not_contains "<text>"]`,
+    `file "<path>" (exists | contains "<text>" | matches "<regex>")`,
+    `git changed "<glob>"`. A `cmd` check with none of the three assertion clauses is a parse
+    error — a check that asserts nothing catches nothing.
+  - `cmd` runs through a real shell (`sh -c` / `cmd /C`) so redirections like the literal
+    `cargo doc 2>&1` example in `PLAN.md` work as written; this only ever executes commands the
+    repo's own authors put in their own spec file, the same trust boundary as a Makefile or CI
+    step, not untrusted input.
+  - Per-check timeout (`--timeout`, default 120s per `PLAN.md`) implemented with plain
+    `std::process` (no `duct`, which `PLAN.md` explicitly allowed skipping): spawn, hand the
+    `Child` to a thread that blocks on `wait_with_output()`, `recv_timeout` on a channel back on
+    the calling thread. On timeout, the child (spawned in its own process group via
+    `CommandExt::process_group(0)` on Unix) is killed as a whole group (`kill -9 -<pid>`) so a
+    shell that spawned its own children doesn't orphan them; Windows uses `taskkill /PID /T /F`.
+  - `file matches`/`file contains` chomp one trailing newline before matching — Rust's `regex`
+    crate's `$` does not match before a final `\n` by default, and a plain text file with one
+    trailing newline (the overwhelmingly common case) would otherwise silently fail `matches
+    "...$"` patterns in a way that looks like a bug in the check, not the file.
+  - `git changed` shells out to `git diff --name-only HEAD` (same "uncommitted + staged vs.
+    HEAD" convention `stage::classify` already uses) and matches the result against a `globset`
+    pattern.
+  - `verify_change(store, repo_root, slug, stages, timeout) -> Vec<CriterionResult>` runs every
+    criterion found across the change's artifacts and returns pass/fail + failing detail per
+    criterion — this is what both `dlt verify` and `dlt archive`'s gate call into.
+  - `watch_and_rerun(repo_root, on_change)`: a generic, notify-backed blocking loop — `notify`
+    owns the watching, `cli.rs` owns formatting/printing via the callback, keeping `verify.rs`
+    UI-agnostic and `cli.rs` "dispatch only" per its module boundary. Debounces a burst of
+    filesystem events (e.g. a `cargo build`) into a single rerun by draining the event channel
+    for 300ms after the first relevant event before re-running. Filters out `.git`/`.delta`/
+    `target`/`node_modules` noise.
+- `dlt verify [slug] [--watch] [--timeout <secs>]`: verifies one change if `slug` is given, else
+  every in-flight change (`change::list_changes`). Prints `[pass]`/`[FAIL]` per criterion with
+  indented failing detail on failure. Exit code **2** if anything failed — the literal "makes it
+  a CI gate" requirement — via a new `CliError::ChecksFailed { failed, total }` variant (not a
+  real Rust error, just the vehicle for a non-zero exit with a summary message, since "some
+  checks failed" is data `dlt verify` produces successfully, not a failure of verification
+  itself).
+- `dlt archive <slug> [--force]`: now runs the same `verify::verify_change` gate before
+  archiving (in addition to prompt 1's staleness check, which still applies). Without `--force`,
+  any failing check refuses the archive with the same exit code 2. With `--force`, a new
+  `change::mark_verify_forced` stamps `verify_forced: true` onto every existing artifact of the
+  change *before* the move into `archive/` — the literal "recorded in the archived frontmatter"
+  requirement — and only when a failure was actually bypassed (an unforced-but-clean archive
+  never touches the field). `Frontmatter.verify_forced` is `Option<bool>` with
+  `skip_serializing_if = "Option::is_none"`, so it's entirely absent from the YAML on every
+  artifact that was never force-archived, not present-and-`false`.
+- `error.rs`: `VerifyError` replaced its prompt-0 `Unimplemented` stub with real variants
+  (`Workspace`, `Change`, `Watch`). `CliError` gained `Verify(#[from] VerifyError)` and
+  `ChecksFailed`; exit-code mapping follows the established nested-nested pattern (`Workspace(Io)`
+  → 1, other `Workspace`/`Change` → their existing rules, `Watch` → 1, `ChecksFailed` → 2).
+
+**Dependencies:** `globset`, `regex` (both already transitively present from `stage.rs`'s use of
+`serde_yaml`/`minijinja`, now direct dependencies too), and `notify` — the one dependency
+decision worth recording. `notify`'s Linux backend pulls in `inotify-sys`, a `-sys`-named crate,
+which on its face looks like exactly what `PLAN.md`'s "if a crate pulls in a `-sys` dependency,
+find another crate" rule forbids. Checked its `build.rs` before adding it anyway: no `cc`
+build-dependency, no vendored/compiled C source — it's `extern "C"` declarations resolved
+against the Linux kernel's inotify syscalls via glibc/musl, functionally identical in kind to the
+plain `libc` crate already transitively present everywhere in this tree, and it only needs an
+external link (`pkg-config` for `libinotify`) on NetBSD/OpenBSD, never on the Linux target this
+project actually ships. The "no C dependencies" rule's real target — established in prompt 2's
+`aws-lc-sys` rejection — is vendored/compiled crypto libraries and OS-trust-store fallbacks that
+break static musl builds and the zero-setup promise; a syscall-binding crate needed for the exact
+feature (`notify` for watch mode) that `PLAN.md`'s own dependency table names for this prompt
+doesn't implicate either concern. Confirmed by rebuilding `--target x86_64-unknown-linux-musl`
+with all three new deps in the tree: still `static-pie linked, statically linked` per `file`/
+`ldd`, same as prompt 2's verification.
+
+**Verified:**
+
+- `cargo clippy --all-targets -- -D warnings` clean.
+- `cargo test` — 74 passing (67 unit including 14 new in `verify`, one new in `change`
+  (`mark_verify_forced_stamps_every_existing_artifact`); 7 `tests/cli.rs` integration, unchanged
+  from prompt 1 — the existing `archive_moves_change_and_applies_deltas_to_truth` test still
+  passes unmodified since a change with no `## Acceptance Criteria` section yields zero
+  criteria, so the new archive gate is a no-op for it). Confirmed green under both
+  `--test-threads=1` and default parallelism.
+- `cargo fmt --check` clean.
+- `cargo build --target x86_64-unknown-linux-musl` clean; binary confirmed still fully static.
+- Manual end-to-end smoke test in a scratch git repo: hand-wrote five acceptance criteria into a
+  change's `proposal.md` (two `file` checks that pass, one `file contains` that fails, one `cmd`
+  that passes, one `git changed` that fails since nothing was actually changed) → `dlt verify
+  <slug>` printed 3 pass / 2 fail with correct failing detail, exit 2 → `dlt archive <slug>`
+  (no `--force`) refused with the same 2 failures printed, exit 2 → `dlt archive <slug> --force`
+  archived successfully, printed which checks were bypassed, and the archived `proposal.md`
+  frontmatter now literally contains `verify_forced: true` → separately, `dlt verify <slug>
+  --watch` backgrounded, printed its initial pass, was triggered by touching a file in the repo,
+  printed a second identical pass, then was killed cleanly. All behaved as designed.
+
+**What prompt 5 should assume:**
+
+- `verify::verify_change`/`Criterion`/`Check`/`CriterionResult` are the load-bearing public
+  surface of this module; `dlt run`'s stage output validation (`stage::validate`, prompt 3) and
+  this module's acceptance-criteria checking remain two distinct, independently-failing gates on
+  purpose — prompt 5's tool loop should not conflate them.
+- `change::mark_verify_forced` and `Frontmatter.verify_forced` exist specifically for the
+  archive-bypass audit trail; if prompt 5's `dlt undo`/journal needs to know whether an archived
+  change's checks were actually clean, this field is the source of truth (its *absence* means
+  clean or never-archived, not "assume false" — it's `Option<bool>`, so check for `Some(true)`
+  specifically, not just truthiness).
+- `verify::watch_and_rerun`'s debounce/noise-filtering pattern (a raw `notify` channel drained
+  for a short window after the first relevant event, `WATCH_NOISE_DIRS` skipping `.git`/`.delta`/
+  `target`/`node_modules`) is the only place `notify` is used so far — if prompt 5's journal or
+  prompt 6's TUI ever need filesystem watching too, this is the reference implementation, not a
+  one-off.
+- `dlt verify`'s check DSL (`cmd`/`file`/`git`) is intentionally minimal and text-based, matching
+  `PLAN.md`'s literal three examples plus one invented `git changed` syntax (the plan only
+  describes "files changed within a glob" prose, no literal syntax) — no plans exist for a fourth
+  check kind; if one is needed later it likely wants its own `parse_*_check`/`Check` variant
+  following the same pattern, not a generalized plugin system that hasn't been asked for.
+- `CliError::ChecksFailed` is the second "non-error error" on `CliError` (after nothing else,
+  really — it's the first of its kind) used purely to carry an exit code and summary message for
+  a condition that isn't a Rust `Err` anywhere else in the call chain; prompt 5's approval-gate
+  denials (`auto`/`prompt`/`deny`) may want the same shape rather than inventing a new error
+  variant per tool that doesn't wrap a real failure.

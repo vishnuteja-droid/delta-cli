@@ -121,6 +121,10 @@ pub enum CliError {
     Provider(#[from] ProviderError),
     #[error("failed to start async runtime: {0}")]
     Runtime(#[from] std::io::Error),
+    #[error(transparent)]
+    Verify(#[from] VerifyError),
+    #[error("verification failed: {failed} of {total} acceptance criteria did not pass")]
+    ChecksFailed { failed: usize, total: usize },
 }
 
 impl CliError {
@@ -142,6 +146,11 @@ impl CliError {
             ) => 1,
             CliError::Provider(_) => 2,
             CliError::Runtime(_) => 1,
+            CliError::Verify(VerifyError::Workspace(WorkspaceError::Io { .. })) => 1,
+            CliError::Verify(VerifyError::Workspace(_)) => 2,
+            CliError::Verify(VerifyError::Change(err)) => change_exit_code(err),
+            CliError::Verify(VerifyError::Watch { .. }) => 1,
+            CliError::ChecksFailed { .. } => 2,
         }
     }
 }
@@ -154,11 +163,16 @@ fn change_exit_code(err: &ChangeError) -> u8 {
     }
 }
 
+/// Executable verification: parsing `## Acceptance Criteria` checklists
+/// out of a change's artifacts and running their declared `verify:` checks.
 #[derive(Debug, Error)]
-#[allow(dead_code)] // constructed once verify.rs gains real logic in prompt 4
 pub enum VerifyError {
-    #[error("verification engine not yet implemented")]
-    Unimplemented,
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error(transparent)]
+    Change(#[from] ChangeError),
+    #[error("failed to watch {path} for changes: {reason}")]
+    Watch { path: String, reason: String },
 }
 
 #[derive(Debug, Error)]

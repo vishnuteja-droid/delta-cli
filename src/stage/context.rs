@@ -269,6 +269,7 @@ mod tests {
                 source_hash: crate::change::source_hash(&[]),
                 status: crate::change::ArtifactStatus::Valid,
                 rigor: Some(crate::stage::Rigor::Standard),
+                verify_forced: None,
             },
             body: "# Proposal\n\nAdd a health check endpoint.\n".to_string(),
         };

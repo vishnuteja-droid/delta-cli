@@ -42,6 +42,13 @@ pub struct Frontmatter {
     /// skip a stage for a change we can't classify.
     #[serde(default)]
     pub rigor: Option<Rigor>,
+    /// Set to `true` when this artifact was archived via `dlt archive
+    /// --force` while its change had failing acceptance-criteria checks
+    /// — the literal "recorded in the archived frontmatter" requirement.
+    /// Omitted (not just `false`) on every artifact where `--force`
+    /// never bypassed a failure, so its presence alone is the signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_forced: Option<bool>,
 }
 
 /// An artifact: YAML frontmatter plus a markdown body.
@@ -195,6 +202,7 @@ pub fn new_change(
             source_hash: source_hash(&[]),
             status: ArtifactStatus::Pending,
             rigor: Some(rigor),
+            verify_forced: None,
         },
         body: placeholder_body(root),
     };
@@ -263,6 +271,7 @@ pub fn write_stage_artifact(
             source_hash,
             status: write.status,
             rigor: write.rigor,
+            verify_forced: None,
         },
         body: write.body.to_string(),
     };
@@ -375,6 +384,24 @@ fn stale_artifacts(
         }
     }
     Ok(stale)
+}
+
+/// Stamp `verify_forced: true` onto every existing artifact of `slug`,
+/// for `dlt archive --force` bypassing failing acceptance-criteria
+/// checks. Called before `archive_change` so the mark travels with the
+/// artifacts into `archive/`.
+pub fn mark_verify_forced(store: &dyn Store, slug: &str) -> Result<(), ChangeError> {
+    for name in store.list_dir(&change_dir(slug))? {
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let path = change_dir(slug).join(&name);
+        let text = store.read_to_string(&path)?;
+        let mut artifact = Artifact::parse(&path.display().to_string(), &text)?;
+        artifact.frontmatter.verify_forced = Some(true);
+        store.write_string(&path, &artifact.render()?)?;
+    }
+    Ok(())
 }
 
 /// Archive a change: refuse if any of its artifacts are stale, apply
@@ -495,6 +522,7 @@ mod tests {
                 source_hash: proposal_hash,
                 status: ArtifactStatus::Valid,
                 rigor: None,
+                verify_forced: None,
             },
             body: "Some design body.".to_string(),
         };
@@ -592,6 +620,7 @@ mod tests {
                 source_hash: "does-not-matter".to_string(),
                 status: ArtifactStatus::NotApplicable,
                 rigor: None,
+                verify_forced: None,
             },
             body: "Skipped: rigor too low.".to_string(),
         };
@@ -607,5 +636,29 @@ mod tests {
 
         archive_change(&store, "tiny-fix", &stages).unwrap();
         assert!(store.exists(&Path::new(ARCHIVE_DIR).join("tiny-fix")));
+    }
+
+    #[test]
+    fn mark_verify_forced_stamps_every_existing_artifact() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let now = Utc::now();
+        let stages = default_stages();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Standard).unwrap();
+
+        let before = store
+            .read_to_string(&artifact_path("add-widgets", "proposal"))
+            .unwrap();
+        // Absent, not `false`, until --force actually bypasses a failure.
+        assert!(!before.contains("verify_forced"));
+
+        mark_verify_forced(&store, "add-widgets").unwrap();
+
+        let after = store
+            .read_to_string(&artifact_path("add-widgets", "proposal"))
+            .unwrap();
+        let artifact = Artifact::parse("proposal.md", &after).unwrap();
+        assert_eq!(artifact.frontmatter.verify_forced, Some(true));
+        assert!(after.contains("verify_forced"));
     }
 }
