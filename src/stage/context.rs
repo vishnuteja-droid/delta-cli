@@ -1,8 +1,10 @@
 //! Assemble the prompt for a stage: `AGENTS.md`, relevant truth, declared
-//! input artifacts, and a repo tree summary, rendered through the
-//! stage's MiniJinja template and trimmed to fit the provider's context
-//! window. `dlt run --dry-run` prints exactly what this builds without
-//! calling anything — this module is how prompt assembly gets debugged.
+//! input artifacts, the stage's own existing artifact body (if any —
+//! this is how user intent and hand-edited drafts reach the model), and
+//! a repo tree summary, rendered through the stage's MiniJinja template
+//! and trimmed to fit the provider's context window. `dlt run --dry-run`
+//! prints exactly what this builds without calling anything — this
+//! module is how prompt assembly gets debugged.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -64,6 +66,13 @@ pub fn assemble<P: Provider>(
         inputs.insert(input_id.clone(), InputRef { body });
     }
 
+    // The stage's *own* existing artifact body, if any — the only
+    // channel a user has to seed intent into a stage with no declared
+    // `inputs` (the root stage's placeholder, written by `change new
+    // --description`, or a hand-edited draft the user wants expanded
+    // rather than replaced). Never dropped for budget, same as `inputs`.
+    let current = change::read_artifact_body(store, slug, &stage.id)?.unwrap_or_default();
+
     let env = minijinja::Environment::new();
     let render =
         |agents_md: &str, truth_relevant: &str, repo_tree: &str| -> Result<String, StageError> {
@@ -72,6 +81,7 @@ pub fn assemble<P: Provider>(
                 truth => context! { relevant => truth_relevant },
                 inputs => Value::from_serialize(&inputs),
                 repo_tree => repo_tree,
+                current => current.as_str(),
             };
             env.render_str(&stage.template, ctx)
                 .map_err(|e| StageError::Render {
@@ -292,6 +302,51 @@ mod tests {
         let assembled = assemble(&store, dir.path(), &stage, "demo-change", &provider).unwrap();
 
         insta::assert_snapshot!(assembled.prompt);
+    }
+
+    /// The mechanism that actually answers "how do I tell dlt what
+    /// feature to change": a stage's own existing artifact body (here,
+    /// standing in for a `change new --description` seed) must reach
+    /// the rendered prompt via `{{ current }}`.
+    #[test]
+    fn current_stage_body_is_available_to_its_own_template() {
+        let (dir, store) = setup();
+        let provider = StubProvider {
+            context_window: 100_000,
+        };
+        let mut stage = proposal_stage();
+        stage.template = "Task: {{ current }}\n".to_string();
+
+        let now = chrono::Utc::now();
+        let seeded = crate::change::Artifact {
+            frontmatter: crate::change::Frontmatter {
+                stage: "proposal".to_string(),
+                created: now,
+                updated: now,
+                source_hash: crate::change::source_hash(&[]),
+                status: crate::change::ArtifactStatus::Pending,
+                rigor: None,
+                verify_forced: None,
+            },
+            body: "Add a health check endpoint at /healthz.".to_string(),
+        };
+        store
+            .write_string(
+                &Path::new(CHANGES_DIR)
+                    .join("my-feature")
+                    .join("proposal.md"),
+                &seeded.render().unwrap(),
+            )
+            .unwrap();
+
+        let assembled = assemble(&store, dir.path(), &stage, "my-feature", &provider).unwrap();
+        assert!(
+            assembled
+                .prompt
+                .contains("Add a health check endpoint at /healthz."),
+            "prompt was: {}",
+            assembled.prompt
+        );
     }
 
     #[test]

@@ -8,7 +8,11 @@ template: |
   {{ truth.relevant }}
   ## Repository
   {{ repo_tree }}
-  Describe the change: the problem it solves and the shape of the fix.
+  ## What the user asked for
+  {{ current }}
+  Expand the above into a full proposal: the problem it solves and the
+  shape of the fix. If nothing was given above beyond a placeholder,
+  say so plainly rather than inventing a feature.
 output:
   required_sections: [Problem, Approach]
   validators:

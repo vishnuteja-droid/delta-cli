@@ -8,6 +8,8 @@ template: |
   {{ truth.relevant }}
   ## Proposal
   {{ inputs.proposal.body }}
+  ## Existing draft, if any (refine it rather than restarting from scratch)
+  {{ current }}
   Produce a technical design covering interfaces, data, and risks.
 output:
   required_sections: [Interfaces, Data, Risks, Alternatives Considered]

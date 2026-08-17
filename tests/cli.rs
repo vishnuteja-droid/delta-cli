@@ -125,6 +125,47 @@ fn stale_design_blocks_archive_with_exit_code_4() {
         .code(4);
 }
 
+/// The end-to-end answer to "how do I tell dlt what feature to
+/// change": `--description` seeds the placeholder proposal, and
+/// `dlt run proposal --dry-run` (no provider call, no API key needed)
+/// must actually include it in the assembled prompt — using the real
+/// seeded `stages/proposal.yaml`, not a test fixture.
+#[test]
+fn change_new_description_reaches_the_dry_run_prompt() {
+    let dir = TempDir::new().expect("tempdir");
+    dlt().current_dir(dir.path()).arg("init").assert().success();
+
+    fs::write(
+        dir.path().join(".delta/config.toml"),
+        "[providers.default]\nkind = \"gemini\"\nbase_url = \"https://example.invalid\"\nmodel = \"test-model\"\napi_key_env = \"TEST_KEY_NOT_SET\"\n",
+    )
+    .expect("write provider config");
+
+    dlt()
+        .current_dir(dir.path())
+        .args([
+            "change",
+            "new",
+            "add-healthcheck",
+            "--description",
+            "Add a health check endpoint at /healthz.",
+        ])
+        .assert()
+        .success();
+
+    let stdout = stdout_of(dlt().current_dir(dir.path()).args([
+        "run",
+        "proposal",
+        "--change",
+        "add-healthcheck",
+        "--dry-run",
+    ]));
+    assert!(
+        stdout.contains("Add a health check endpoint at /healthz."),
+        "stdout was: {stdout}"
+    );
+}
+
 #[test]
 fn archive_moves_change_and_applies_deltas_to_truth() {
     let dir = TempDir::new().expect("tempdir");

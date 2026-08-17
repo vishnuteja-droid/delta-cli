@@ -891,6 +891,7 @@ mod tests {
             now,
             &stages,
             crate::stage::Rigor::Standard,
+            None,
         )
         .unwrap();
 

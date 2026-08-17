@@ -8,6 +8,8 @@ template: |
   {{ inputs.proposal.body }}
   ## Design
   {{ inputs.design.body }}
+  ## Existing draft, if any (refine it rather than restarting from scratch)
+  {{ current }}
   Break the design into a checklist of concrete implementation tasks.
 output:
   required_sections: [Tasks]

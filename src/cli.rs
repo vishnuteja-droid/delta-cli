@@ -118,6 +118,12 @@ pub enum ChangeCommand {
         /// Force a rigor classification instead of inferring it from `git diff`.
         #[arg(long)]
         rigor: Option<Rigor>,
+        /// What you want built — seeds the proposal so `dlt run proposal`
+        /// has something to expand on instead of a bare placeholder.
+        /// Omit it and edit `.delta/changes/<slug>/proposal.md` by hand
+        /// instead, if you'd rather.
+        #[arg(long)]
+        description: Option<String>,
     },
     /// List in-flight changes.
     List,
@@ -127,7 +133,11 @@ pub fn dispatch(command: &Command, repo_root: &Path, config: &Config) -> Result<
     match command {
         Command::Init => cmd_init(repo_root),
         Command::Change { command } => match command {
-            ChangeCommand::New { slug, rigor } => cmd_change_new(repo_root, slug, *rigor),
+            ChangeCommand::New {
+                slug,
+                rigor,
+                description,
+            } => cmd_change_new(repo_root, slug, *rigor, description.as_deref()),
             ChangeCommand::List => cmd_change_list(repo_root),
         },
         Command::Status => cmd_status(repo_root),
@@ -155,11 +165,19 @@ fn cmd_change_new(
     repo_root: &Path,
     slug: &str,
     rigor_override: Option<Rigor>,
+    description: Option<&str>,
 ) -> Result<(), CliError> {
     let workspace = Workspace::discover(repo_root)?;
     let stages = stage::load_all(workspace.store())?;
     let rigor = rigor_override.unwrap_or_else(|| stage::classify::classify(repo_root));
-    change::new_change(workspace.store(), slug, Utc::now(), &stages, rigor)?;
+    change::new_change(
+        workspace.store(),
+        slug,
+        Utc::now(),
+        &stages,
+        rigor,
+        description,
+    )?;
     println!("Created change '{slug}' (.delta/changes/{slug}), rigor: {rigor}");
     Ok(())
 }

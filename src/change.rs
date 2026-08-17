@@ -154,8 +154,16 @@ fn find_stage<'a>(
         .ok_or_else(|| ChangeError::UnknownStage { id: id.to_string() })
 }
 
-fn placeholder_body(stage: &StageDefinition) -> String {
-    format!("# {}\n\nTODO: describe the change.\n", stage.name)
+/// The root stage's initial artifact body. With a `description`, that
+/// text becomes the seed a `dlt run` picks up via `stage::context`'s
+/// `current` template variable — this is the only channel a user has to
+/// tell the pipeline what they actually want built; without it, `dlt
+/// run proposal` has nothing but repo context to go on.
+fn placeholder_body(stage: &StageDefinition, description: Option<&str>) -> String {
+    match description {
+        Some(description) => format!("# {}\n\n{description}\n", stage.name),
+        None => format!("# {}\n\nTODO: describe the change.\n", stage.name),
+    }
 }
 
 /// Read a change's artifact body for `stage_id`, if it exists yet.
@@ -178,12 +186,15 @@ pub(crate) fn read_artifact_body(
 /// Create a change: `changes/<slug>/deltas/` plus a placeholder artifact
 /// for the stage graph's root stage (the one with no declared inputs),
 /// recording `rigor` on it for later stages to read via `change_rigor`.
+/// `description`, if given, seeds that placeholder's body — see
+/// `placeholder_body`.
 pub fn new_change(
     store: &dyn Store,
     slug: &str,
     now: DateTime<Utc>,
     stages: &[StageDefinition],
     rigor: Rigor,
+    description: Option<&str>,
 ) -> Result<(), ChangeError> {
     validate_slug(slug)?;
     if store.exists(&change_dir(slug)) {
@@ -204,7 +215,7 @@ pub fn new_change(
             rigor: Some(rigor),
             verify_forced: None,
         },
-        body: placeholder_body(root),
+        body: placeholder_body(root, description),
     };
     store.write_string(&artifact_path(slug, &root.id), &artifact.render()?)?;
     Ok(())
@@ -485,11 +496,34 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "add-widgets", now, &stages, Rigor::Standard).unwrap();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Standard, None).unwrap();
 
         let status = change_status(&store, "add-widgets", now, &stages).unwrap();
         assert_eq!(status.stage, "proposal");
         assert_eq!(status.state, ArtifactStatus::Pending);
+    }
+
+    #[test]
+    fn new_change_with_description_seeds_the_placeholder_body() {
+        let dir = TempDir::new().unwrap();
+        let store = store(&dir);
+        let now = Utc::now();
+        let stages = default_stages();
+        new_change(
+            &store,
+            "add-widgets",
+            now,
+            &stages,
+            Rigor::Standard,
+            Some("Add a health check endpoint at /healthz."),
+        )
+        .unwrap();
+
+        let body = read_artifact_body(&store, "add-widgets", "proposal")
+            .unwrap()
+            .unwrap();
+        assert!(body.contains("Add a health check endpoint at /healthz."));
+        assert!(!body.contains("TODO: describe the change"));
     }
 
     #[test]
@@ -498,8 +532,8 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "dup", now, &stages, Rigor::Standard).unwrap();
-        let err = new_change(&store, "dup", now, &stages, Rigor::Standard).unwrap_err();
+        new_change(&store, "dup", now, &stages, Rigor::Standard, None).unwrap();
+        let err = new_change(&store, "dup", now, &stages, Rigor::Standard, None).unwrap_err();
         assert!(matches!(err, ChangeError::AlreadyExists { .. }));
     }
 
@@ -509,7 +543,7 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "rework-auth", now, &stages, Rigor::Standard).unwrap();
+        new_change(&store, "rework-auth", now, &stages, Rigor::Standard, None).unwrap();
 
         // Hand-craft a design.md whose hash matches the current proposal body,
         // simulating a design stage that already ran successfully.
@@ -560,7 +594,7 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "add-widgets", now, &stages, Rigor::Standard).unwrap();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Standard, None).unwrap();
         store
             .write_string(
                 &deltas_dir("add-widgets").join("widgets.md"),
@@ -597,7 +631,7 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "add-widgets", now, &stages, Rigor::Trivial).unwrap();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Trivial, None).unwrap();
         assert_eq!(
             change_rigor(&store, &stages, "add-widgets").unwrap(),
             Rigor::Trivial
@@ -610,7 +644,7 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "tiny-fix", now, &stages, Rigor::Trivial).unwrap();
+        new_change(&store, "tiny-fix", now, &stages, Rigor::Trivial, None).unwrap();
 
         let skipped = Artifact {
             frontmatter: Frontmatter {
@@ -644,7 +678,7 @@ mod tests {
         let store = store(&dir);
         let now = Utc::now();
         let stages = default_stages();
-        new_change(&store, "add-widgets", now, &stages, Rigor::Standard).unwrap();
+        new_change(&store, "add-widgets", now, &stages, Rigor::Standard, None).unwrap();
 
         let before = store
             .read_to_string(&artifact_path("add-widgets", "proposal"))

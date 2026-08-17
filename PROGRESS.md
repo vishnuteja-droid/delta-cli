@@ -800,3 +800,56 @@ bugs to fix) before writing any TUI code.
 6. `dlt build <slug>` to run the tool loop — it will print a diff or command and ask `[y/N]`
    before any write or command execution (`[tools.<name>].policy` in config changes that).
 7. `dlt undo` reverts the most recent `write_file`/`apply_patch` from `dlt build` if needed.
+
+## Between sessions — closing the "how do I tell it what to build" gap (user request)
+
+While walking through the "how do I run this" instructions above, the user asked the obvious next
+question: how do you actually tell `dlt` what feature you want? The honest answer, on inspection,
+was "you can't" — a real gap, not a documentation shortfall. `change new` wrote a literal
+`TODO: describe the change.` placeholder into `proposal.md`, and `dlt run proposal`'s template
+(`stages/proposal.yaml`) never read that file at all (the proposal stage has `inputs: []`, and
+`stage::context::assemble` only ever exposed *declared* `inputs`, never a stage's own existing
+artifact). Every `dlt run proposal` regenerated from nothing but `AGENTS.md`/truth/repo-tree,
+discarding whatever the user had written, every time. This would have surfaced immediately in the
+user's live validation run, so it's fixed now rather than left for them to discover.
+
+**Shipped:**
+- `change::new_change` gained `description: Option<&str>`; `placeholder_body` seeds the root
+  stage's artifact with it verbatim when given, instead of the `TODO` text.
+- `dlt change new <slug> --description "..."` — the CLI surface for the above. Multi-line or more
+  involved descriptions still work the old way too: `change new` without `--description` writes
+  the same placeholder as before, and the user can hand-edit `.delta/changes/<slug>/proposal.md`
+  before running `dlt run proposal` — both paths land on the same mechanism below.
+- `stage::context::assemble` now also reads the stage's **own** existing artifact body (via the
+  already-`pub(crate)` `change::read_artifact_body`) and exposes it to the template as `current` —
+  never dropped for the token budget, same tier as declared `inputs`. This is a general mechanism,
+  not proposal-specific: for `design`/`tasks` it means a hand-edited draft gets *refined* on a
+  rerun rather than silently discarded, which was a latent version of the same bug for every stage,
+  not just the root one.
+- `stages/proposal.yaml`'s template now has a `## What the user asked for` section rendering
+  `{{ current }}`, with explicit instruction not to invent a feature if it's still just the
+  placeholder; `design.yaml`/`tasks.yaml` each gained a `## Existing draft, if any (refine it
+  rather than restarting from scratch)` section doing the same.
+
+**Verified:**
+- New unit test `stage::context::tests::current_stage_body_is_available_to_its_own_template`
+  (a synthetic `{{ current }}`-only template, proving the plumbing in isolation).
+- New integration test `change_new_description_reaches_the_dry_run_prompt` in `tests/cli.rs` —
+  drives the real binary against the *actual* seeded `stages/proposal.yaml` (not a test fixture):
+  `dlt init` → `dlt change new --description "..."` → `dlt run proposal --dry-run`, asserting the
+  description text appears in the assembled prompt. No provider call, no API key needed
+  (`--dry-run` only needs a `[providers.default]` block to exist, per prompt 3's
+  `load_for_dry_run`) — this is what actually caught that the fix works end to end, not just that
+  it compiles: the pre-existing `stage::default_stages()` test fixture used by the snapshot test is
+  a hand-written literal, completely decoupled from the real `stages/*.yaml` files, so it would
+  never have exercised this template change at all.
+- `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt --check` clean, `cargo test` — 127
+  passing (119 unit, 8 integration — both new tests, existing suite unaffected including the
+  design-prompt insta snapshot, which never referenced the new `current` variable in the first
+  place). `cargo build --target x86_64-unknown-linux-musl` still fully static.
+
+**Note for whoever picks this up next:** `.delta/stages/*.yaml` is only seeded from the repo-root
+`stages/*.yaml` on `dlt init` and never re-synced afterward (by design — once seeded, it's the
+user's file to edit). Anyone who already ran `dlt init` before this fix landed needs to either
+delete `.delta` and re-init, or manually add a `{{ current }}` reference to their own
+`.delta/stages/*.yaml`, to pick this up.
