@@ -22,6 +22,14 @@ single static binary, single build path. Being built prompt-by-prompt from `PLAN
 - `cargo clippy --all-targets -- -D warnings` — must be clean before a prompt is considered done
 - `cargo fmt` — format; `cargo fmt --check` in CI-equivalent checks
 - `cargo run -- <args>` — run the binary
+- `dlt --version`'s commit hash and build target come from `build.rs` (`DLT_GIT_HASH`/
+  `DLT_BUILD_TARGET` env vars baked in at compile time, read via `env!()` in `cli.rs`) — falls
+  back to `"unknown"` for either if `git` or a `.git` dir isn't present at build time (e.g. a
+  release tarball), never a build failure.
+- `.github/workflows/release.yml` runs `cargo fmt --check`/clippy/test on every push and PR,
+  then cross-builds all five `PLAN.md` prompt-7 targets on every push/PR too (so a
+  cross-compilation regression shows up immediately, not just at tag time); it only cuts a
+  GitHub Release when a `v*` tag is pushed.
 
 ## Conventions
 

@@ -2,7 +2,9 @@
 //! Maps parsed commands to calls into the other modules and translates
 //! their results into process exit codes. Holds no business logic itself.
 
+use std::io::IsTerminal as _;
 use std::io::Write as _;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
@@ -25,10 +27,22 @@ use crate::workspace::{Store, Workspace};
 /// `stage::context::assemble` reserves when trimming the prompt to fit.
 const RUN_MAX_TOKENS: u32 = 4_096;
 
+/// `<crate version> (<commit>, <target triple>)`, e.g.
+/// `0.1.0 (a1b2c3d, x86_64-unknown-linux-musl)` — commit hash and build
+/// target baked in by `build.rs`, per PLAN.md prompt 7.
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("DLT_GIT_HASH"),
+    ", ",
+    env!("DLT_BUILD_TARGET"),
+    ")"
+);
+
 #[derive(Parser)]
 #[command(
     name = "dlt",
-    version,
+    version = VERSION,
     about = "Terminal-first AI development lifecycle tool"
 )]
 pub struct Cli {
@@ -71,6 +85,9 @@ pub enum Command {
         #[command(subcommand)]
         command: TuiCommand,
     },
+    /// Check config, provider reachability, terminal capabilities, and
+    /// git presence — a first stop when something isn't working.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -193,6 +210,7 @@ pub fn dispatch(command: &Command, repo_root: &Path, config: &Config) -> Result<
             TuiCommand::Run(args) => cmd_tui_run(repo_root, config, args),
             TuiCommand::Build(args) => cmd_tui_build(repo_root, config, args),
         },
+        Command::Doctor => cmd_doctor(repo_root, config),
     }
 }
 
@@ -967,5 +985,130 @@ fn format_state(state: ArtifactStatus) -> &'static str {
         ArtifactStatus::Stale => "stale",
         ArtifactStatus::Failed => "failed",
         ArtifactStatus::NotApplicable => "n/a",
+    }
+}
+
+/// Diagnostic sweep, `flutter doctor`-style: every check is advisory, not
+/// gating — `dlt doctor` always exits 0. Its job is to say *why* some
+/// other command might be about to fail (no workspace, an unreachable
+/// provider, no TTY, no git), not to be a second, redundant validator of
+/// things `dlt run`/`dlt build`/`dlt tui` already report clearly
+/// themselves when actually invoked. A malformed `.delta/config.toml`
+/// still fails fast in `main.rs` before dispatch ever reaches here — that
+/// failure is already a clear `ConfigError::Parse` with exit code 1, and
+/// duplicating that check here would just be a second copy of the same
+/// logic to keep in sync.
+fn cmd_doctor(repo_root: &Path, config: &Config) -> Result<(), CliError> {
+    println!("dlt {VERSION}\n");
+
+    println!("Workspace:");
+    match Workspace::discover(repo_root) {
+        Ok(workspace) => println!(
+            "  [ok] .delta workspace found at {}",
+            workspace.root().display()
+        ),
+        Err(_) => println!("  [warn] no .delta workspace here — run `dlt init`"),
+    }
+
+    println!("\nGit:");
+    match std::process::Command::new("git").arg("--version").output() {
+        Ok(output) if output.status.success() => {
+            let version = String::from_utf8_lossy(&output.stdout);
+            println!("  [ok] {}", version.trim());
+        }
+        _ => println!(
+            "  [warn] git not found on PATH — rigor classification and `git changed` checks fall back to defaults"
+        ),
+    }
+
+    println!("\nTerminal:");
+    if std::io::stdout().is_terminal() {
+        println!("  [ok] stdout is a TTY");
+    } else {
+        println!("  [warn] stdout is not a TTY — `dlt tui` needs an interactive terminal");
+    }
+    if tui::color::supports_truecolor() {
+        println!(
+            "  [ok] truecolor supported (COLORTERM={:?})",
+            std::env::var("COLORTERM").unwrap_or_default()
+        );
+    } else {
+        println!("  [info] no truecolor signal from COLORTERM — the TUI falls back to 256-colour");
+    }
+
+    println!("\nProviders:");
+    let names = config.provider_names();
+    if names.is_empty() {
+        println!("  [info] none configured — see README for a [providers.<name>] example");
+    } else {
+        for name in names {
+            print_provider_check(config, &name);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_provider_check(config: &Config, name: &str) {
+    let base_url = match config.get_str(&format!("providers.{name}.base_url")) {
+        Some(url) => url,
+        None => {
+            println!("  {name}: [warn] missing base_url");
+            return;
+        }
+    };
+    match check_reachable(base_url) {
+        Ok(()) => println!("  {name} ({base_url}): [ok] reachable"),
+        Err(reason) => println!("  {name} ({base_url}): [FAIL] {reason}"),
+    }
+}
+
+/// A plain TCP connect to the provider's host:port — enough to tell
+/// "network/DNS/firewall problem" apart from "model rejected the
+/// request," without spending a token or requiring `api_key_env` to be
+/// set. Synchronous on purpose: `dlt doctor` has no other reason to pay
+/// for a tokio runtime.
+fn check_reachable(base_url: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(base_url).map_err(|e| format!("invalid base_url: {e}"))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| "base_url has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "base_url has no resolvable port".to_string())?;
+    let addr = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("DNS resolution failed: {e}"))?
+        .next()
+        .ok_or_else(|| "DNS resolution returned no addresses".to_string())?;
+    TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map(|_| ())
+        .map_err(|e| format!("connection failed: {e}"))
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_malformed_base_url() {
+        let err = check_reachable("not a url").unwrap_err();
+        assert!(err.contains("invalid base_url"), "{err}");
+    }
+
+    #[test]
+    fn rejects_url_with_no_host() {
+        // A "file:" URL parses fine but has no host to connect to.
+        let err = check_reachable("file:///etc/hosts").unwrap_err();
+        assert!(err.contains("no host"), "{err}");
+    }
+
+    #[test]
+    fn refuses_connection_on_a_closed_port() {
+        // Nothing listens on port 1 on loopback; this exercises the
+        // connect-failure path without depending on outbound network
+        // access, which this sandbox's tests can't assume either way.
+        let err = check_reachable("http://127.0.0.1:1").unwrap_err();
+        assert!(err.contains("connection failed"), "{err}");
     }
 }

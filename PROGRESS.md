@@ -1035,3 +1035,138 @@ fresh, never-cancelled token, since it has no interrupt mechanism of its own. Ve
   screen / crossterm behavior under Windows ConPTY vs. legacy console is explicitly prompt 7's
   job, per `PLAN.md`'s "verify the Windows build under both ConPTY and legacy console") — this
   session's musl build check confirms static linking, not terminal behavior on another platform.
+
+## Session 7 — Prompt 7 (Ship)
+
+**Shipped, per `PLAN.md`'s six bullets:**
+
+- `Cargo.toml`: `[profile.release]` — `opt-level = "z"`, `lto = true`, `codegen-units = 1`,
+  `strip = true`, `panic = "abort"`. `panic = "abort"` is safe here specifically because nothing
+  in the tree calls `catch_unwind` — `ratatui::restore()` (prompt 6) runs from a panic *hook*, not
+  unwind-based `Drop` cleanup, so the terminal still gets restored before the process aborts.
+- `build.rs` (new, crate root): bakes `DLT_GIT_HASH` (`git rev-parse --short HEAD`, falling back
+  to `"unknown"` rather than failing the build if `git` or `.git` isn't present — e.g. a release
+  tarball built outside a checkout) and `DLT_BUILD_TARGET` (Cargo's own `TARGET` env var, which
+  is the cross-compilation target, not the build host — `cfg!(target_...)` would have been wrong
+  here) into `rustc-env` vars, with `cargo:rerun-if-changed` on `.git/HEAD`/`.git/index` so it
+  only reruns when the checked-out commit actually moves. No new dependency — plain
+  `std::process::Command`, matching `PLAN.md`'s dependency table having nothing listed for this
+  prompt.
+- `cli.rs`: `dlt --version` now reports `<crate version> (<commit>, <target triple>)` via a
+  `concat!(env!(...))`-built `VERSION: &str` constant passed to `#[command(version = VERSION)]`
+  (clap's derive accepts any `Into<Str>` expression there, not just a literal) — confirmed with
+  `./dlt --version` → `dlt 0.1.0 (f0aa1ee, x86_64-unknown-linux-gnu)`.
+- `dlt doctor` (`cmd_doctor` in `cli.rs`, new `Command::Doctor`): a `flutter doctor`-style sweep —
+  workspace presence (`.delta` found or "run `dlt init`"), git presence (`git --version`),
+  terminal capabilities (stdout `IsTerminal`, `tui::color::supports_truecolor()` reused directly
+  rather than re-implemented), and provider reachability. **Every check is advisory; `dlt doctor`
+  always exits 0** — its job is explaining why some other command might be about to fail, not
+  re-validating what `dlt run`/`dlt build`/`dlt tui` already report clearly when actually invoked.
+  One real design decision: a malformed `.delta/config.toml` never reaches `cmd_doctor` at all,
+  since `main.rs` loads config and fails fast (a clear `ConfigError::Parse`, exit 1) before
+  `dispatch` runs — `doctor` doesn't duplicate that check, since duplicating it would just be a
+  second copy of the same logic to keep in sync, not a real gap (the existing failure is already
+  clear about what's wrong).
+  - Provider reachability is a plain synchronous TCP connect (3s timeout) to the provider's
+    `base_url` host:port via `reqwest::Url` for parsing + `std::net::TcpStream::connect_timeout` —
+    deliberately not a real HTTP request, so `dlt doctor` never spends a token, never requires
+    `api_key_env` to even be set, and never needs a tokio runtime (every other synchronous command
+    in this binary shares that property; only `cmd_run`/`cmd_build`/the TUI's background thread pay
+    tokio's startup cost).
+  - `config.rs` gained `Config::provider_names() -> Vec<String>` (sorted keys of the `[providers]`
+    table) so `doctor` can enumerate whatever's configured without hardcoding a provider name —
+    the first thing in this module that reads the *shape* of a table section rather than a single
+    dotted key.
+- `.github/workflows/release.yml` (new): a `test` job (fmt/clippy/test) gating a `build` matrix
+  across all five targets `PLAN.md` names — `x86_64-unknown-linux-musl`/
+  `aarch64-unknown-linux-musl` via `cross` (Docker-based; Ubuntu's own package repos have no
+  aarch64-musl cross-toolchain, and `cross`'s images carry the same musl toolchain either way, so
+  both Linux targets get identical static, no-cert-store binaries) on `ubuntu-latest`;
+  `x86_64-apple-darwin`/`aarch64-apple-darwin` natively on `macos-latest` (no cross-toolchain
+  exists for these off of Apple's own toolchain, so this is the one pair of targets that
+  genuinely needs that runner, not emulation); `x86_64-pc-windows-gnu` on `ubuntu-latest` via
+  `mingw-w64` (the **-gnu** target specifically, never `-msvc`, so nothing in the pipeline depends
+  on a Windows toolchain existing anywhere). The matrix builds on every push/PR (so a
+  cross-compilation regression is visible immediately, not discovered at tag time) but only a
+  `v*` tag triggers the `release` job, which flattens every matrix job's packaged artifact
+  (`.tar.gz` for Unix, `.zip` for Windows, README bundled into each) and calls `gh release
+  create` — the GitHub CLI already on every runner, not a third-party release action — to publish
+  them. Third-party actions used are limited to `dtolnay/rust-toolchain` (the community-standard,
+  widely-trusted rustup wrapper) and `Swatinem/rust-cache` (pure caching, no code execution
+  surface); everything else is a first-party `actions/*` action or plain shell.
+- `README.md` (new, repo root): quickstart (init → configure a provider → doctor → change new →
+  run proposal/design/tasks → build → verify → archive, plus the `dlt tui` equivalents),
+  installing (prebuilt release binaries vs. `cargo build --release`), full config reference
+  (`[providers.<name>]`'s six keys with real examples for all three provider kinds, `[tools.*]`
+  approval policy), the artifact format (a real captured example of `proposal.md`'s frontmatter,
+  `source_hash`/staleness/`n/a` semantics), authoring a custom stage (the exact YAML schema, every
+  MiniJinja template variable, the context-budget drop order), writing verification checks (the
+  literal three-check-kind grammar and the exact `PLAN.md` acceptance-criteria example, copied
+  from `verify.rs`'s own doc comment/tests rather than re-derived), a full command reference
+  table, and exit codes. Every concrete detail in it (the frontmatter example, the `verify:`
+  grammar, the config keys) was pulled from the actual source/a real command run in this
+  session, not written from memory of what prompt 3/4/5 were supposed to produce.
+
+**Verified — what this sandbox actually could and couldn't check:**
+
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` clean.
+- `cargo test` — 178 passing (170 unit including 5 new — 3 for `check_reachable`'s pure
+  error-path branches in `cli.rs`, 2 for `Config::provider_names`; 8 `tests/cli.rs` integration,
+  unchanged). Confirmed green under both default parallelism and `--test-threads=1`.
+- `cargo build --release --target x86_64-unknown-linux-musl`: `file`/`ldd` confirm
+  `static-pie linked, statically linked` (unchanged conclusion from prompt 2, re-confirmed under
+  the new LTO/strip/panic=abort release profile, not just the old dev profile), stripped, 7.4M.
+  `env -i dlt --version` (zero environment, no `HOME`, no cert env vars) succeeds. Re-ran prompt
+  2's throwaway-`examples/tls_smoke_test.rs`-under-`strace`-with-`env -i` technique against this
+  release build specifically (deleted again after use, never committed): zero matches for
+  `ssl/certs|ca-certificates|/etc/pki|/etc/ssl|share/ca-cert` in the syscall trace. This session's
+  sandbox routes outbound HTTPS through a proxy whose MITM certificate isn't in the compiled-in
+  webpki-roots set, so the handshake itself correctly failed with `InvalidCertificate
+  (UnknownIssuer)` rather than completing with HTTP 200 the way prompt 2's session saw — but that
+  failure is actually a *stronger* confirmation of the same claim: the binary never fell back to
+  any OS trust store (which might have trusted the proxy's cert) even when doing so would have
+  "fixed" the connection, and the strace log is proof it never touched one.
+- `cargo build --release --target x86_64-pc-windows-gnu`: succeeds in this sandbox after `apt-get
+  install mingw-w64` + `rustup target add`; `file` confirms a valid `PE32+ executable (console)
+  x86-64 ... for MS Windows`, 6.6M. **This is as far as this sandbox can verify the Windows
+  target** — there's no `wine`/Windows machine available here, so **running the binary under
+  ConPTY or a legacy `cmd.exe` console, and specifically confirming the TUI's raw-mode/alternate-
+  screen behavior on real Windows, has not happened and is not something this session could do.**
+  This is the literal thing `PLAN.md` asks this prompt to verify that remains genuinely
+  unverified — flagging it explicitly rather than assuming a compiling `.exe` is equivalent to a
+  working terminal UI on Windows.
+- `aarch64-unknown-linux-musl`, `x86_64-apple-darwin`, `aarch64-apple-darwin`: **not built in this
+  session** — no aarch64-musl cross-linker (no `aarch64-linux-musl-gcc`, no `zig`) and no Apple
+  toolchain exist in this sandbox. This is exactly what the GitHub Actions matrix
+  (`cross`-in-Docker for the musl target, native `macos-latest` runners for the two Darwin
+  targets) is for, and is untested by this session beyond the workflow YAML parsing cleanly
+  (`python3 -c "import yaml; yaml.safe_load(...)"`) and the same job definitions already having
+  proven themselves on the one Linux target this sandbox *can* cross-build for real
+  (`x86_64-unknown-linux-musl` via plain `cargo build`, `x86_64-pc-windows-gnu` via `mingw-w64` —
+  neither of those actually exercises `cross`/Docker, which only the aarch64-musl job uses). The
+  workflow has never actually run on GitHub Actions itself in this session — it's new, untested
+  YAML, not a passing pipeline.
+- Manual smoke test of `dlt doctor` in a scratch git repo: before `dlt init` → workspace `[warn]`;
+  after `dlt init` + a hand-written `[providers.default]`/`[providers.unreachable]` in
+  `.delta/config.toml` → `default` (real `https://api.anthropic.com`) reports `[ok] reachable`,
+  `unreachable` (`http://127.0.0.1:1`) reports `[FAIL] connection failed: Connection refused (os
+  error 111)`; exit code 0 in every case, confirming the "advisory, never gating" design.
+
+**What comes after this (this was the last prompt in `PLAN.md`) should assume:**
+
+- The project is now feature-complete per `PLAN.md`'s seven prompts. Anything from here is either
+  a real bug found in live use (this repo's own established pattern: fix it, document it, keep
+  going — see the Gemini-provider and `current`-artifact-body entries above for precedent) or a
+  genuinely new feature the user asks for, not a `PLAN.md` prompt to advance through.
+  `AGENTS.md`'s "never implement beyond the current prompt" no longer has a "current prompt" to
+  bound it — good judgement about scope replaces it.
+  - Confirming the Windows and aarch64-musl/Apple-Darwin builds *actually* work — not just that
+    they compile in this sandbox's reach, or that the workflow YAML is well-formed — needs a real
+    GitHub Actions run (push a commit, watch the matrix) and, for the Windows terminal-behavior
+    half of `PLAN.md`'s literal requirement, an actual Windows machine with a human at the
+    keyboard. Nothing in this codebase can close that gap by itself.
+  - The live end-to-end validation question raised at the end of prompt 6 (a real proposal →
+    design → tasks → build run against a real provider) was still open as of this session's start
+    and wasn't resolved during it either — this remains the most valuable thing to actually see
+    happen before trusting any of this in anger, more valuable than any further build/tooling
+    polish.

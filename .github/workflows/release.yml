@@ -1,0 +1,138 @@
+name: Release
+
+# Runs the full check suite on every push/PR, then a cross-compile matrix
+# across every target PLAN.md's prompt 7 names. The matrix always builds
+# (so cross-compilation regressions show up on ordinary PRs, not just at
+# tag time) but a GitHub Release with the packaged binaries is only cut
+# when a `v*` tag is pushed.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Both Linux targets go through `cross` (Docker-based), which
+          # carries its own musl cross-toolchains — including aarch64's,
+          # which Ubuntu's package repos don't ship — and produces the
+          # same statically-linked, no-cert-store binary either way.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            builder: cross
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            builder: cross
+          # Native builds on Apple's own toolchain — no cross-toolchain
+          # exists for these off of macOS, so this genuinely needs the
+          # macos-latest runner rather than emulation.
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            builder: cargo
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            builder: cargo
+          # mingw-w64 turns Ubuntu's linker into a Windows cross-linker;
+          # this is the *-gnu target (not -msvc) so nothing here depends
+          # on a Windows toolchain existing anywhere in the pipeline.
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            builder: cargo
+            apt: mingw-w64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs embeds `git rev-parse --short HEAD` into `dlt
+          # --version`; a shallow checkout still has HEAD, but fetch
+          # everything so the hash matches what `git log` on the repo
+          # itself would show, not an artifact of CI's shallow clone.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install ${{ matrix.apt }}
+        if: matrix.apt
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        run: cargo install cross --locked
+      - name: Build (cross)
+        if: matrix.builder == 'cross'
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Build (cargo)
+        if: matrix.builder == 'cargo'
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="dlt-${{ matrix.target }}"
+          mkdir -p "$stage"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            cp "target/${{ matrix.target }}/release/dlt.exe" "$stage/"
+            cp README.md "$stage/"
+            (cd "$stage" && zip -r "../$stage.zip" .)
+          else
+            cp "target/${{ matrix.target }}/release/dlt" "$stage/"
+            cp README.md "$stage/"
+            tar -czf "$stage.tar.gz" "$stage"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlt-${{ matrix.target }}
+          path: |
+            dlt-${{ matrix.target }}.tar.gz
+            dlt-${{ matrix.target }}.zip
+          if-no-files-found: ignore
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} release/ \;
+          ls -la release
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --title "dlt $GITHUB_REF_NAME" \
+            --generate-notes

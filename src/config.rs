@@ -60,6 +60,20 @@ impl Config {
         }
         Some(current)
     }
+
+    /// Names of every `[providers.<name>]` table declared in config, in
+    /// sorted order. Used by `dlt doctor` to check reachability of
+    /// whatever's configured, without hardcoding a provider name.
+    pub fn provider_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .table
+            .get("providers")
+            .and_then(Value::as_table)
+            .map(|table| table.keys().cloned().collect())
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
 }
 
 fn merge_file(table: &mut Table, path: &Path) -> Result<(), ConfigError> {
@@ -179,6 +193,35 @@ mod tests {
             std::env::remove_var("DELTA_WORKSPACE_DIR");
         }
         assert_eq!(config.get_str("workspace_dir"), Some("from-env"));
+    }
+
+    #[test]
+    fn provider_names_lists_declared_providers_sorted() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        std::fs::create_dir_all(repo.path().join(".delta")).unwrap();
+        let mut file = std::fs::File::create(repo.path().join(".delta/config.toml")).unwrap();
+        writeln!(
+            file,
+            r#"
+[providers.zeta]
+kind = "openai_compatible"
+
+[providers.alpha]
+kind = "anthropic"
+"#
+        )
+        .unwrap();
+        let config = Config::load(repo.path()).unwrap();
+        assert_eq!(config.provider_names(), vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn provider_names_empty_when_none_configured() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let repo = TempDir::new().unwrap();
+        let config = Config::load(repo.path()).unwrap();
+        assert!(config.provider_names().is_empty());
     }
 
     #[test]
