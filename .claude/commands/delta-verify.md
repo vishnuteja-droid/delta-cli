@@ -30,7 +30,7 @@ That is the entire command.
 
 This is the one command in the lifecycle where a model must not participate in
 the judgement. The runner prints its own frame, its own results, and its own
-summary. It exits 0, 1, 2, or 3, and that exit code is the answer.
+summary. It exits with a code from 0 to 6, and that exit code is the answer.
 
 Do not:
 
@@ -46,18 +46,26 @@ change is not done, and the next step belongs to whoever reads the failure.
 ## What the exit codes mean
 
 - **0** — every criterion has a check, every check passed, every MANUAL
-  criterion is signed off.
-- **1** — at least one check failed.
+  criterion is signed off. This also covers a check marked
+  `# EXPECT: fail-until-fixed` that is still failing: that is a *reproduction*,
+  not a failure — the bug is confirmed and the fix isn't written yet.
+- **1** — at least one ordinary check failed.
 - **2** — at least one criterion has no corresponding check. The spec claims
   something nothing proves.
 - **3** — at least one MANUAL criterion has no recorded sign-off in
   `run/signoff.md`.
 - **4** — the runner could not run at all: no such change, no spec, or no
   criteria in the spec.
+- **5** — only when run as `delta/bin/verify --archive-gate` (which `archive`
+  does automatically): a reproduction is still outstanding, so folding this
+  change into truth would record a bug as fixed that isn't.
+- **6** — a `fail-until-fixed` check passed without ever having failed first.
+  The reproduction doesn't reproduce, so the criterion is wrong.
 
 Codes 2 and 3 exist because a criterion silently counted as passing is worse
 than a criterion that fails loudly. Never describe a 2 or a 3 as "passing with
-caveats". Nothing ran.
+caveats". Nothing ran. Code 6 exists for the same reason: a bug "fixed" by a
+reproduction that never reproduced is a false green, not a win.
 
 ## Signature frame
 
