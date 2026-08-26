@@ -1,0 +1,409 @@
+#!/bin/sh
+# delta verify - run the checks bound to a change's acceptance criteria.
+#
+# Usage:  delta/bin/verify [change-id]
+#         DELTA_CHANGE=<id> delta/bin/verify
+#
+# With no argument the most recently modified directory under delta/changes/
+# is used.
+#
+# Exit codes:
+#   0  every criterion has a check, every check passed, every MANUAL signed off
+#   1  at least one check failed
+#   2  at least one criterion has no corresponding check
+#   3  at least one MANUAL criterion has no recorded sign-off
+#   4  cannot run at all (no such change, no spec, no criteria)
+#
+# When several apply the precedence is 1 > 2 > 3. A criterion is never counted
+# as passing because nothing ran for it; that is what codes 2 and 3 exist for.
+#
+# No model is involved in this script. A check is an executable file: it exits
+# 0 or it does not.
+
+set -u
+
+RUNNER_VERSION=1
+TAB=$(printf "\t")
+
+# ---------------------------------------------------------------- locate ----
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 4
+DELTA_DIR=$(dirname -- "$script_dir")
+ROOT=$(dirname -- "$DELTA_DIR")
+CHANGES_DIR="$DELTA_DIR/changes"
+
+die() {
+    printf '  delta verify: %s\n' "$1" >&2
+    exit 4
+}
+
+change=${1:-${DELTA_CHANGE:-}}
+if [ -z "$change" ]; then
+    [ -d "$CHANGES_DIR" ] || die "no delta/changes/ directory yet - run propose first"
+    change=$(ls -t "$CHANGES_DIR" 2>/dev/null | head -n 1)
+    [ -n "$change" ] || die "no changes under delta/changes/ - run propose first"
+fi
+
+# An argument containing a slash is treated as a path to a change directory;
+# anything else is an id under delta/changes/.
+change=${change%/}
+case "$change" in
+    */*) CHANGE_DIR=$change ;;
+    *)   CHANGE_DIR="$CHANGES_DIR/$change" ;;
+esac
+label=${CHANGE_DIR##*/}
+SPEC="$CHANGE_DIR/spec.md"
+CHECKS_DIR="$CHANGE_DIR/checks"
+SIGNOFF="$CHANGE_DIR/run/signoff.md"
+
+[ -d "$CHANGE_DIR" ] || die "no such change: $change"
+[ -f "$SPEC" ]       || die "no spec.md in $CHANGE_DIR"
+
+# ---------------------------------------------------------- capabilities ----
+
+is_tty=0
+[ -t 1 ] && is_tty=1
+
+use_color=$is_tty
+[ -n "${NO_COLOR-}" ] && use_color=0
+
+loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+case "$loc" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) unicode=1 ;;
+    *)                             unicode=0 ;;
+esac
+
+cols=0
+case "${COLUMNS-}" in ''|*[!0-9]*) : ;; *) cols=$COLUMNS ;; esac
+if [ "$cols" -eq 0 ] && command -v tput >/dev/null 2>&1; then
+    cols=$(tput cols 2>/dev/null) || cols=0
+fi
+case "$cols" in ''|*[!0-9]*) cols=0 ;; esac
+[ "$cols" -lt 40 ] && cols=80
+[ "$cols" -gt 100 ] && cols=100
+
+spinner_ok=0
+if [ "$is_tty" -eq 1 ] && sleep 0.1 2>/dev/null; then
+    spinner_ok=1
+fi
+
+if [ "$unicode" -eq 1 ]; then
+    G_PASS='✓'; G_FAIL='✗'; G_MAN='○'; G_PEND='·'
+    SIG='Δ'; RULE='─'; SEP='·'; ELL='…'
+    SPIN='⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏'
+    GLYPH_W=1
+else
+    G_PASS='[ok]'; G_FAIL='[FAIL]'; G_MAN='[man]'; G_PEND='...'
+    SIG='d'; RULE='-'; SEP='-'; ELL='~'
+    SPIN='- \ | /'
+    GLYPH_W=6
+fi
+
+SPIN_N=0
+for _f in $SPIN; do SPIN_N=$((SPIN_N + 1)); done
+
+if [ "$use_color" -eq 1 ]; then
+    C_PASS=$(printf '\033[32m'); C_FAIL=$(printf '\033[31m')
+    C_DIM=$(printf '\033[2m');   C_OFF=$(printf '\033[0m')
+    CLEAR=$(printf '\r\033[2K')
+else
+    C_PASS=''; C_FAIL=''; C_DIM=''; C_OFF=''; CLEAR=''
+fi
+
+# ------------------------------------------------------------- utilities ----
+
+pad() {  # pad $1 with spaces to width $2
+    _s=$1; _w=$2
+    while [ ${#_s} -lt "$_w" ]; do _s="$_s "; done
+    printf '%s' "$_s"
+}
+
+pad_left() {  # right-align $1 in width $2, truncating if it will not fit
+    _s=$1; _w=$2
+    [ ${#_s} -gt "$_w" ] && _s=$(printf '%s' "$_s" | cut -c "1-$_w")
+    while [ ${#_s} -lt "$_w" ]; do _s=" $_s"; done
+    printf '%s' "$_s"
+}
+
+trunc() {  # truncate $1 to width $2, never wrap
+    _s=$1; _w=$2
+    [ "$_w" -lt 4 ] && _w=4
+    if [ ${#_s} -gt "$_w" ]; then
+        _s=$(printf '%s' "$_s" | cut -c "1-$((_w - 1))")
+        _s="$_s$ELL"
+    fi
+    printf '%s' "$_s"
+}
+
+rule_line() {  # signature frame: two spaces, sigil, rule, right-hand label
+    _label=$1
+    _maxlabel=$((cols - 4 - 2 - 3))
+    [ "$_maxlabel" -lt 8 ] && _maxlabel=8
+    [ ${#_label} -gt "$_maxlabel" ] && _label=$(trunc "$_label" "$_maxlabel")
+    _avail=$((cols - 4 - ${#_label} - 2))
+    [ "$_avail" -lt 3 ] && _avail=3
+    _r=''; _i=0
+    while [ "$_i" -lt "$_avail" ]; do _r="$_r$RULE"; _i=$((_i + 1)); done
+    printf '  %s %s  %s\n' "$SIG" "$_r" "$_label"
+}
+
+now_ms() {
+    _n=$(date +%s%N 2>/dev/null)
+    case "$_n" in
+        ''|*[!0-9]*) date +%s 2>/dev/null | awk '{printf "%d", $1 * 1000}' ;;
+        *)           printf '%d' $((_n / 1000000)) ;;
+    esac
+}
+
+fmt_dur() {  # milliseconds -> 0.4s
+    _ms=$1
+    printf '%d.%ds' $((_ms / 1000)) $(((_ms % 1000) / 100))
+}
+
+spin_frame() {
+    _n=$(($1 % SPIN_N)); _i=0
+    for _f in $SPIN; do
+        [ "$_i" -eq "$_n" ] && { printf '%s' "$_f"; return; }
+        _i=$((_i + 1))
+    done
+}
+
+# --------------------------------------------------------------- parsing ----
+
+# Criteria live under an "## Acceptance criteria" heading in spec.md, one per
+# line:   - C1 retry returns 200
+#         - C4 MANUAL errors are readable by support staff
+CRITERIA=$(awk '
+    /^##+[ \t]*[Aa]cceptance [Cc]riteria/ { inblock = 1; next }
+    /^##/                                 { inblock = 0 }
+    inblock && /^[ \t]*-[ \t]+C[0-9]+[ \t]/ {
+        sub(/^[ \t]*-[ \t]+/, "")
+        id = $1
+        sub(/^C[0-9]+[ \t]+/, "")
+        kind = "AUTO"
+        if ($0 ~ /^MANUAL([ \t]|$)/) { kind = "MANUAL"; sub(/^MANUAL[ \t]*/, "") }
+        gsub(/[ \t]+$/, "")
+        printf "%s\t%s\t%s\n", id, kind, $0
+    }
+' "$SPEC")
+
+[ -n "$CRITERIA" ] || die "no acceptance criteria found in $SPEC (expected a '## Acceptance criteria' section with '- C1 ...' lines)"
+
+find_check() {  # echo path of the check bound to criterion $1, if any
+    [ -d "$CHECKS_DIR" ] || return 1
+    for _f in "$CHECKS_DIR"/*; do
+        [ -f "$_f" ] || continue
+        _b=${_f##*/}
+        case "$_b" in
+            "$1"|"$1"[-_.]*) printf '%s' "$_f"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+has_signoff() {
+    [ -f "$SIGNOFF" ] || return 1
+    grep -qE "^[[:space:]]*$1([[:space:]]|:)" "$SIGNOFF"
+}
+
+# ------------------------------------------------------------------ setup ----
+
+started_utc=$(date -u +%Y-%m-%dT%H-%M-%S)
+RUN_DIR="$CHANGE_DIR/run/$started_utc"
+mkdir -p "$RUN_DIR" || die "cannot create $RUN_DIR"
+
+RESULTS="$RUN_DIR/results.tsv"
+{
+    printf 'criterion\tstatus\texit_code\tstarted_utc\tduration_ms\tlog\tdescription\n'
+} > "$RESULTS"
+
+git_rev=$(cd "$ROOT" && git rev-parse HEAD 2>/dev/null) || git_rev=unknown
+{
+    printf 'change: %s\n'          "$label"
+    printf 'started_utc: %s\n'     "$started_utc"
+    printf 'git_rev: %s\n'         "$git_rev"
+    printf 'runner_version: %s\n'  "$RUNNER_VERSION"
+    printf 'root: %s\n'            "$ROOT"
+} > "$RUN_DIR/meta.txt"
+
+# Column geometry. Ids are short; widen for C10+ if present.
+idw=2
+for _line in $(printf '%s\n' "$CRITERIA" | cut -f1); do
+    [ ${#_line} -gt "$idw" ] && idw=${#_line}
+done
+durw=10  # widest right-hand word: "signed off"
+descw=$((cols - 2 - GLYPH_W - 1 - idw - 2 - durw - 1))
+[ "$descw" -lt 12 ] && descw=12
+
+emit() {  # $1 glyph, $2 colour, $3 id, $4 desc, $5 right-hand column
+    printf '%s  %s %s %s %s%s\n' "$CLEAR" \
+        "$2$(pad "$1" "$GLYPH_W")$C_OFF" \
+        "$(pad "$3" "$idw")" \
+        "$(pad "$(trunc "$4" "$descw")" "$descw")" \
+        "$C_DIM" "$(pad_left "$5" "$durw")$C_OFF"
+}
+
+# ------------------------------------------------------------------- run ----
+
+total=0; passed=0; failed=0; manual=0; manual_open=0; unchecked=0
+FAILLOG="$RUN_DIR/.failures"
+WARNLOG="$RUN_DIR/.warnings"
+: > "$FAILLOG"
+: > "$WARNLOG"
+
+rule_line "delta verify $SEP $label"
+printf '\n'
+
+run_started=$(now_ms)
+
+printf '%s\n' "$CRITERIA" | while IFS='	' read -r id kind desc; do
+    [ -n "$id" ] || continue
+    total=$((total + 1))
+
+    if [ "$kind" = MANUAL ]; then
+        if has_signoff "$id"; then
+            emit "$G_MAN" "$C_DIM" "$id" "$desc" "signed off"
+            printf '%s\tmanual-signed\t\t%s\t\t\t%s\n' "$id" "$started_utc" "$desc" >> "$RESULTS"
+        else
+            emit "$G_MAN" "$C_DIM" "$id" "$desc" "manual"
+            printf '%s\tmanual-open\t\t%s\t\t\t%s\n' "$id" "$started_utc" "$desc" >> "$RESULTS"
+            printf 'manual\t%s\t%s\n' "$id" "$desc" >> "$FAILLOG"
+        fi
+        continue
+    fi
+
+    chk=$(find_check "$id") || chk=''
+    if [ -z "$chk" ]; then
+        emit "$G_FAIL" "$C_FAIL" "$id" "$desc" "no check"
+        printf '%s\tno-check\t\t%s\t\t\t%s\n' "$id" "$started_utc" "$desc" >> "$RESULTS"
+        printf 'nocheck\t%s\t%s\n' "$id" "$desc" >> "$FAILLOG"
+        continue
+    fi
+
+    log="$RUN_DIR/$id.log"
+    rel_log="run/$started_utc/$id.log"
+
+    # A check whose CRITERION header disagrees with its filename is a
+    # copy-paste error worth surfacing; it does not change the exit code.
+    hdr=$(grep -m1 '^#[ \t]*CRITERION:' "$chk" 2>/dev/null | sed 's/^#[ \t]*CRITERION:[ \t]*//')
+    case "$hdr" in
+        '') : ;;
+        "$id"|"$id "*|"$id$TAB"*) : ;;
+        *) printf '%s: CRITERION header does not start with %s\n' "${chk##*/}" "$id" >> "$WARNLOG" ;;
+    esac
+
+    if [ ! -x "$chk" ]; then
+        printf 'check file is not executable: %s\nrun: chmod +x %s\n' "$chk" "$chk" > "$log"
+        emit "$G_FAIL" "$C_FAIL" "$id" "$desc" "not exec"
+        printf '%s\tfailed\t126\t%s\t0\t%s\t%s\n' "$id" "$started_utc" "$rel_log" "$desc" >> "$RESULTS"
+        printf 'fail\t%s\tcheck file is not executable (chmod +x)\t%s\n' "$id" "$rel_log" >> "$FAILLOG"
+        continue
+    fi
+
+    t0=$(now_ms)
+    if [ "$spinner_ok" -eq 1 ]; then
+        ( cd "$ROOT" && DELTA_CHANGE_DIR="$CHANGE_DIR" DELTA_CHECK_DIR="$CHECKS_DIR" \
+            DELTA_RUN_DIR="$RUN_DIR" DELTA_CRITERION="$id" exec "$chk" ) >"$log" 2>&1 &
+        cpid=$!
+        i=0
+        while kill -0 "$cpid" 2>/dev/null; do
+            printf '\r  %s %s %s' "$(spin_frame "$i")" \
+                "$(pad "$id" "$idw")" "$(trunc "$desc" "$descw")"
+            i=$((i + 1))
+            sleep 0.1
+        done
+        wait "$cpid"; rc=$?
+    else
+        [ "$is_tty" -eq 0 ] || printf '  %s %s %s\n' "$(pad "$G_PEND" "$GLYPH_W")" \
+            "$(pad "$id" "$idw")" "$(trunc "$desc" "$descw")"
+        ( cd "$ROOT" && DELTA_CHANGE_DIR="$CHANGE_DIR" DELTA_CHECK_DIR="$CHECKS_DIR" \
+            DELTA_RUN_DIR="$RUN_DIR" DELTA_CRITERION="$id" exec "$chk" ) >"$log" 2>&1
+        rc=$?
+    fi
+    t1=$(now_ms)
+    dur=$((t1 - t0))
+    [ "$dur" -lt 0 ] && dur=0
+
+    if [ "$rc" -eq 0 ]; then
+        emit "$G_PASS" "$C_PASS" "$id" "$desc" "$(fmt_dur "$dur")"
+        printf '%s\tpassed\t0\t%s\t%s\t%s\t%s\n' "$id" "$started_utc" "$dur" "$rel_log" "$desc" >> "$RESULTS"
+    else
+        emit "$G_FAIL" "$C_FAIL" "$id" "$desc" "$(fmt_dur "$dur")"
+        printf '%s\tfailed\t%s\t%s\t%s\t%s\t%s\n' "$id" "$rc" "$started_utc" "$dur" "$rel_log" "$desc" >> "$RESULTS"
+        detail=$(grep -v '^[ \t]*$' "$log" 2>/dev/null | tail -n 1)
+        [ -n "$detail" ] || detail="exited $rc with no output"
+        printf 'fail\t%s\t%s\t%s\n' "$id" "$detail" "$rel_log" >> "$FAILLOG"
+    fi
+done
+
+run_ms=$(( $(now_ms) - run_started ))
+[ "$run_ms" -lt 0 ] && run_ms=0
+
+# The while loop above runs in a subshell (pipeline), so recount from results.
+total=$(awk 'NR > 1' "$RESULTS" | wc -l | tr -d ' ')
+passed=$(awk -F'\t' 'NR > 1 && $2 == "passed"' "$RESULTS" | wc -l | tr -d ' ')
+failed=$(awk -F'\t' 'NR > 1 && $2 == "failed"' "$RESULTS" | wc -l | tr -d ' ')
+unchecked=$(awk -F'\t' 'NR > 1 && $2 == "no-check"' "$RESULTS" | wc -l | tr -d ' ')
+manual=$(awk -F'\t' 'NR > 1 && ($2 == "manual-open" || $2 == "manual-signed")' "$RESULTS" | wc -l | tr -d ' ')
+manual_open=$(awk -F'\t' 'NR > 1 && $2 == "manual-open"' "$RESULTS" | wc -l | tr -d ' ')
+
+# ------------------------------------------------------------- reporting ----
+
+if [ -s "$WARNLOG" ]; then
+    printf '\n'
+    while IFS= read -r w; do
+        printf '  %s%s  %s%s\n' "$C_DIM" "$(pad '!' "$GLYPH_W")" "$w" "$C_OFF"
+    done < "$WARNLOG"
+fi
+
+# Failure detail goes above the summary so the summary is what stays on screen.
+if [ -s "$FAILLOG" ]; then
+    printf '\n'
+    while IFS='	' read -r what id detail rel; do
+        case "$what" in
+            fail)
+                printf '  %s%s%s %s  %s\n' "$C_FAIL" "$(pad "$G_FAIL" "$GLYPH_W")" "$C_OFF" \
+                    "$(pad "$id" "$idw")" "$detail"
+                [ -n "${rel:-}" ] && printf '  %s%s%s\n' "$C_DIM" \
+                    "$(pad '' $((GLYPH_W + idw + 3)))$rel" "$C_OFF"
+                ;;
+            nocheck)
+                printf '  %s%s%s %s  %s\n' "$C_FAIL" "$(pad "$G_FAIL" "$GLYPH_W")" "$C_OFF" \
+                    "$(pad "$id" "$idw")" "no check bound to this criterion"
+                printf '  %s%s%s\n' "$C_DIM" \
+                    "$(pad '' $((GLYPH_W + idw + 3)))add an executable $CHECKS_DIR/$id-*.sh" "$C_OFF"
+                ;;
+            manual)
+                printf '  %s%s %s  %s%s\n' "$C_DIM" "$(pad "$G_MAN" "$GLYPH_W")" \
+                    "$(pad "$id" "$idw")" "awaiting sign-off: $detail" "$C_OFF"
+                printf '  %s%s%s\n' "$C_DIM" \
+                    "$(pad '' $((GLYPH_W + idw + 3)))record it in run/signoff.md" "$C_OFF"
+                ;;
+        esac
+    done < "$FAILLOG"
+fi
+
+summary="$total criteria $SEP $passed passed"
+[ "$failed"    -gt 0 ] && summary="$summary $SEP $failed failed"
+[ "$unchecked" -gt 0 ] && summary="$summary $SEP $unchecked unchecked"
+[ "$manual"    -gt 0 ] && summary="$summary $SEP $manual manual"
+summary="$summary $SEP $(fmt_dur "$run_ms")"
+
+printf '\n'
+rule_line "$summary"
+
+{
+    printf '%s\n' "$summary"
+    printf 'change: %s\n' "$label"
+    printf 'run: %s\n' "$started_utc"
+} > "$RUN_DIR/summary.txt"
+
+rm -f "$FAILLOG" "$WARNLOG"
+
+# --------------------------------------------------------------- exit code ----
+
+if   [ "$failed"      -gt 0 ]; then exit 1
+elif [ "$unchecked"   -gt 0 ]; then exit 2
+elif [ "$manual_open" -gt 0 ]; then exit 3
+else                                exit 0
+fi

@@ -1,0 +1,194 @@
+#!/bin/sh
+# delta generate-commands - emit per-CLI command files from delta/commands/
+# using the format table in delta/adapters.yaml.
+#
+# Usage:  delta/bin/generate-commands [--check] [adapter-id ...]
+#
+#   --check   generate into a temporary tree and diff against what is
+#             committed; exit 1 if they differ. For CI.
+#
+# The generated files are committed. Regenerate after editing anything in
+# delta/commands/, and commit the result.
+#
+# Adding a CLI is an entry in delta/adapters.yaml. It is never a change to
+# this script.
+
+set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+DELTA_DIR=$(dirname -- "$script_dir")
+ROOT=$(dirname -- "$DELTA_DIR")
+TABLE="$DELTA_DIR/adapters.yaml"
+SRC="$DELTA_DIR/commands"
+
+die() { printf 'generate-commands: %s\n' "$1" >&2; exit 1; }
+
+[ -f "$TABLE" ] || die "no adapters.yaml at $TABLE"
+[ -d "$SRC" ]   || die "no commands directory at $SRC"
+
+check_mode=0
+if [ "${1-}" = --check ]; then check_mode=1; shift; fi
+want=$*
+
+# --------------------------------------------------------------- the table ---
+# Emit one tab-separated record per adapter, fields in a fixed order. This
+# reads the fixed subset of YAML that adapters.yaml uses - a list of maps with
+# scalar values - and nothing more.
+read_table() {
+    awk '
+        function flush() {
+            if (f["id"] == "") return
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+                f["id"], f["name"], f["dir"], f["ext"], f["naming"],
+                f["format"], f["args"], f["name_field"], f["invoke"]
+            for (k in f) delete f[k]
+        }
+        /^adapters:/ { inlist = 1; next }
+        !inlist { next }
+        /^  - / {
+            flush()
+            line = $0
+            sub(/^  - /, "", line)
+            split(line, kv, ": ")
+            key = kv[1]
+            val = substr(line, length(key) + 3)
+            f[key] = val
+            next
+        }
+        /^    [a-z_]+:/ {
+            line = $0
+            sub(/^    /, "", line)
+            idx = index(line, ":")
+            key = substr(line, 1, idx - 1)
+            val = substr(line, idx + 2)
+            gsub(/^[ \t]+|[ \t]+$/, "", val)
+            # strip one layer of surrounding quotes
+            if (val ~ /^".*"$/) val = substr(val, 2, length(val) - 2)
+            f[key] = val
+            next
+        }
+        END { flush() }
+    ' "$TABLE"
+}
+
+# ------------------------------------------------------------ file surgery ---
+
+front_matter() { awk 'NR == 1 && $0 == "---" { inside = 1; next }
+                      inside && $0 == "---"   { exit }
+                      inside                  { print }' "$1"; }
+
+body()         { awk 'NR == 1 && $0 == "---" { inside = 1; next }
+                      inside && $0 == "---"   { inside = 0; started = 1; next }
+                      started                 { print }' "$1"; }
+
+fm_value()     { front_matter "$1" | awk -v k="$2" '
+                      { idx = index($0, ":")
+                        if (idx && substr($0, 1, idx - 1) == k) {
+                            v = substr($0, idx + 2)
+                            gsub(/^[ \t]+|[ \t]+$/, "", v)
+                            if (v ~ /^".*"$/) v = substr(v, 2, length(v) - 2)
+                            print v; exit } }'; }
+
+subst_args()   { awk -v tok="$1" '{ gsub(/\$ARGUMENTS/, tok); print }'; }
+
+# ---------------------------------------------------------------- generate ---
+
+generate_into() {
+    out_root=$1
+    written=0
+    adapters=0
+
+    read_table | while IFS='	' read -r id name dir ext naming format args name_field invoke; do
+        [ -n "$id" ] || continue
+        if [ -n "$want" ]; then
+            found=0
+            for w in $want; do [ "$w" = "$id" ] && found=1; done
+            [ "$found" -eq 1 ] || continue
+        fi
+        adapters=$((adapters + 1))
+
+        case "$naming" in
+            subdir) target_dir="$out_root/$dir/delta" ;;
+            prefix) target_dir="$out_root/$dir" ;;
+            *) die "adapter $id: unknown naming '$naming'" ;;
+        esac
+        mkdir -p "$target_dir" || die "cannot create $target_dir"
+
+        for src in "$SRC"/*.md; do
+            [ -f "$src" ] || continue
+            cmd=${src##*/}; cmd=${cmd%.md}
+
+            case "$naming" in
+                subdir) out="$target_dir/$cmd.$ext";       cmdname="delta:$cmd" ;;
+                prefix) out="$target_dir/delta-$cmd.$ext"; cmdname="delta-$cmd" ;;
+            esac
+
+            desc=$(fm_value "$src" description)
+            hint=$(fm_value "$src" argument-hint)
+            tools=$(fm_value "$src" allowed-tools)
+
+            case "$format" in
+                toml)
+                    # Literal multi-line strings: no escape processing, so the
+                    # body passes through untouched. Guard the one sequence
+                    # that would terminate it early.
+                    if body "$src" | grep -q "'''"; then
+                        die "$src contains ''' which cannot be embedded in TOML"
+                    fi
+                    {
+                        printf '# Generated by delta/bin/generate-commands from delta/commands/%s.md\n' "$cmd"
+                        printf '# Edit that file and regenerate; do not edit this one.\n\n'
+                        printf 'description = "%s"\n' "$(printf '%s' "$desc" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+                        printf 'prompt = %s\n' "'''"
+                        body "$src" | subst_args "$args"
+                        printf '%s\n' "'''"
+                    } > "$out"
+                    ;;
+                frontmatter)
+                    {
+                        printf -- '---\n'
+                        [ "$name_field" = yes ] && printf 'name: %s\n' "$cmdname"
+                        [ -n "$desc" ]  && printf 'description: %s\n' "$desc"
+                        [ -n "$hint" ]  && printf 'argument-hint: "%s"\n' "$hint"
+                        [ -n "$tools" ] && printf 'allowed-tools: %s\n' "$tools"
+                        printf -- '---\n\n'
+                        printf '<!-- Generated by delta/bin/generate-commands from delta/commands/%s.md.\n' "$cmd"
+                        printf '     Edit that file and regenerate; do not edit this one. -->\n'
+                        body "$src" | subst_args "$args"
+                    } > "$out"
+                    ;;
+                plain)
+                    body "$src" | subst_args "$args" > "$out"
+                    ;;
+                *) die "adapter $id: unknown format '$format'" ;;
+            esac
+            written=$((written + 1))
+            [ "$check_mode" -eq 1 ] || printf '  %-14s %s\n' "$id" "${out#$out_root/}"
+        done
+    done
+}
+
+if [ "$check_mode" -eq 1 ]; then
+    tmp=$(mktemp -d) || die "cannot make a temporary directory"
+    trap 'rm -rf "$tmp"' EXIT
+    generate_into "$tmp"
+    rc=0
+    read_table | while IFS='	' read -r id name dir ext naming format args name_field invoke; do
+        [ -d "$tmp/$dir" ] || continue
+        diff -ru "$ROOT/$dir" "$tmp/$dir" >/dev/null 2>&1 || {
+            printf 'out of date: %s\n' "$dir" >&2
+            diff -ru "$ROOT/$dir" "$tmp/$dir" >&2
+            exit 1
+        }
+    done || rc=1
+    if [ "$rc" -eq 0 ]; then
+        printf 'generated command files are up to date\n'
+    else
+        printf '\nrun: delta/bin/generate-commands\n' >&2
+    fi
+    exit "$rc"
+fi
+
+printf '\n'
+generate_into "$ROOT"
+printf '\n'

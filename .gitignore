@@ -1,0 +1,3 @@
+# Verification run output is local evidence, not source. The signoff.md that
+# resolves MANUAL criteria is tracked; the per-run directories are not.
+delta/changes/*/run/*/

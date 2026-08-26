@@ -1,0 +1,85 @@
+# delta adapters — the CLI format table.
+#
+# Each entry describes where one tool looks for command files and what shape
+# they take. `delta/bin/generate-commands` reads this file and emits per-tool
+# files from the canonical sources in `delta/commands/`. The generated files
+# are committed.
+#
+# Adding support for a new CLI is an entry in this file. It is never a code
+# change. That is the whole point: this landscape churns, and an adapter
+# written as a code module rots every time a vendor moves a directory.
+#
+# Fields
+#   id          slug used in generator output
+#   name        human name
+#   dir         directory the tool loads commands from, relative to repo root
+#   ext         file extension
+#   naming      prefix -> delta-explore.<ext>        invoked /delta-explore
+#               subdir -> delta/explore.<ext>        invoked /delta:explore
+#   format      frontmatter -> markdown with YAML front matter
+#               toml        -> description + prompt keys
+#               plain       -> body only, front matter stripped
+#   args        the token this tool substitutes arguments into
+#   name_field  yes -> inject `name:` into front matter (Agent Skills style)
+#   verified    date the format below was last checked against live docs
+#   docs        where it was checked
+#   invoke      what the user types
+#   note        anything a reader needs to know about this entry
+#   install     extra step required because the tool cannot load from the repo
+
+adapters:
+  - id: claude
+    name: Claude Code
+    dir: .claude/commands
+    ext: md
+    naming: prefix
+    format: frontmatter
+    args: $ARGUMENTS
+    name_field: no
+    verified: 2026-08-26
+    docs: https://code.claude.com/docs/en/slash-commands
+    invoke: /delta-explore
+    note: Docs define a command name as the file name without extension, and subdirectory namespacing has a standing bug report, so files are emitted flat with a delta- prefix rather than as delta/explore.md.
+    install: none
+
+  - id: gemini
+    name: Gemini CLI
+    dir: .gemini/commands
+    ext: toml
+    naming: subdir
+    format: toml
+    args: "{{args}}"
+    name_field: no
+    verified: 2026-08-26
+    docs: https://geminicli.com/docs/cli/custom-commands/
+    invoke: /delta:explore
+    note: Subdirectories namespace with a colon, so delta/explore.toml becomes /delta:explore. Required key is prompt; description is optional and included.
+    install: none
+
+  - id: antigravity
+    name: Antigravity CLI
+    dir: .agents/skills
+    ext: md
+    naming: prefix
+    format: frontmatter
+    args: $ARGUMENTS
+    name_field: yes
+    verified: 2026-08-26
+    docs: https://antigravity.google/docs/cli/plugins/
+    invoke: /delta-explore
+    note: Workspace skills live in .agents/skills and stay with the repository. A project still carrying .gemini/skills should rename that folder to .agents/skills.
+    install: none
+
+  - id: codex
+    name: Codex
+    dir: .codex/prompts
+    ext: md
+    naming: prefix
+    format: frontmatter
+    args: $ARGUMENTS
+    name_field: no
+    verified: 2026-08-26
+    docs: https://developers.openai.com/codex/custom-prompts
+    invoke: /delta-explore
+    note: Codex loads prompts from $CODEX_HOME/prompts only; project-scoped .codex/prompts is an open feature request, not shipped. Files are emitted here so they are versioned and reviewable, and so they work unchanged if that lands. Codex reads AGENTS.md from the repo natively, which is the path that works today.
+    install: ln -s "$PWD/.codex/prompts"/delta-*.md ~/.codex/prompts/
