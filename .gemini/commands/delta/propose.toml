@@ -74,7 +74,9 @@ Ask these before writing, not after.
 ## Acceptance criteria
 
 Write them under a `## Acceptance criteria` heading, one per line, numbered
-`C1`, `C2`, ... The runner parses this section, so the format is load-bearing:
+`C1`, `C2`, ... An id is an uppercase prefix and a number, so a bug spec can
+number its reproductions `B1`, `B2`. The runner parses this section, so the
+format is load-bearing:
 
     ## Acceptance criteria
 
@@ -146,6 +148,56 @@ Two things you must not do:
 
 How many criteria land as MANUAL is itself information about how testable the
 spec was. Do not tune the number in either direction.
+
+## Bug fixes: when the cause is unknown
+
+Sometimes the intent is a symptom — "duplicate webhooks create two ledger rows",
+"the export times out for large accounts" — not a change you can describe. A
+bug fix does not begin with knowing what to build, and forcing one into the
+normal shape produces a guess dressed as a spec.
+
+When the intent describes something going wrong rather than something to build:
+
+**Open the spec with the behaviour, not the change.** Two short sections before
+anything else:
+
+    ## Observed
+    A webhook redelivered with the same provider_ref inserts a second
+    ledger_entry row.
+
+    ## Expected
+    The second delivery is accepted and inserts nothing.
+
+**The first criterion is the reproduction.** Before any criterion about the fix,
+write a criterion that states the bug, and give its check the header
+`# EXPECT: fail-until-fixed`:
+
+    - B1 a duplicate webhook creates a second ledger row
+
+    #!/bin/sh
+    # CRITERION: B1 a duplicate webhook creates a second ledger row
+    # EXPECT: fail-until-fixed
+    ...
+
+`verify` reports that as `reproduced` rather than failed, and the run exits 0 —
+the bug is confirmed and the fix is not written yet. When the fix lands and the
+check passes, `verify` flips it permanently into an ordinary regression guard
+and records the timestamps. That record is the evidence the fix worked.
+
+If the reproduction passes the first time you run it, the criterion is wrong —
+you have not captured the bug. `verify` reports that as `suspicious` and exits
+6. Fix the reproduction; never write around it.
+
+**Leave MODIFIED empty if you do not know.** For a bug, the delta spec is a
+hypothesis that firms up during `apply`, not a plan written upfront. Write
+`MODIFIED: to be determined during apply — cause not yet known` and move on.
+
+Do not guess at which files change so the section looks complete. An invented
+MODIFIED entry is worse than an empty one: it sends `apply` to the wrong place
+and it reads as knowledge you do not have.
+
+Everything else is unchanged — same five commands, same spec format. A bug is
+not a different lifecycle.
 
 ## Interrogate your own output before finishing
 

@@ -21,5 +21,12 @@ Changes to existing behaviour go through delta, a spec lifecycle that lives in
 
 Run `delta/bin/verify` before claiming any change is complete, and again after
 any change to the checks or the spec. It exits **0** all passed, **1** a check
-failed, **2** a criterion has no check, **3** a MANUAL criterion is unsigned.
-Only 0 means done. A non-zero exit is not a caveat to explain around.
+failed, **2** a criterion has no check, **3** a MANUAL criterion is unsigned,
+**6** a reproduction did not reproduce. Only 0 means done. A non-zero exit is
+not a caveat to explain around.
+
+For a bug fix, write the reproduction first and mark its check
+`# EXPECT: fail-until-fixed`. It is expected to fail until the fix lands, so a
+run reports it as `reproduced` and still exits 0. `archive` runs
+`delta/bin/verify --archive-gate`, which exits **5** while any reproduction is
+still outstanding.

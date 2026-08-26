@@ -34,15 +34,28 @@ history.
 Without this step the lifecycle degrades: truth goes stale, every later delta
 is written against a system that no longer exists, and specs grow to compensate.
 
-## Run verify first
+## Run verify first, with the archive gate
 
-Do not archive a change that has not passed. Run `delta/bin/verify <id>` and
-read the exit code:
+Do not archive a change that has not passed. Run it with the gate:
+
+    delta/bin/verify --archive-gate <id>
+
+and read the exit code:
 
 - **0** — proceed.
-- **1, 2, or 3** — stop. Report the code and what it means. A change with a
-  failing check, an unchecked criterion, or an unsigned MANUAL criterion is not
-  finished, and folding it into truth would record something untrue.
+- **anything else** — stop. Report the code and what it means. A change with a
+  failing check, an unchecked criterion, an unsigned MANUAL criterion, or an
+  outstanding reproduction is not finished, and folding it into truth would
+  record something untrue.
+
+The gate exists for one case in particular. A run with an outstanding
+reproduction exits **0** normally — that is correct, the bug is confirmed and
+the fix is pending — but exits **5** under `--archive-gate`, because archiving
+a bug delta whose reproduction still reproduces would record a bug as fixed
+that is not. The runner names the outstanding criteria; pass them on.
+
+Exit **6** means a reproduction did not reproduce, so the criterion is wrong.
+That is never archivable either.
 
 Do not archive anyway with a note about it. Truth is the one file set the whole
 lifecycle trusts.

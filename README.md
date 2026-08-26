@@ -47,7 +47,8 @@ The runner needs no knowledge of check types, because every check is just a
 program: curl, psql, mvn, npm, jq, `gh` — whatever is already on the machine.
 
 A check is bound to a criterion by filename prefix: `checks/C3-*` serves
-criterion `C3`. Checks run with the working directory at the repository root,
+criterion `C3`. An id is an uppercase prefix and a number, so a bug spec can
+number its reproductions `B1`, `B2`. Checks run with the working directory at the repository root,
 with `$DELTA_CHANGE_DIR`, `$DELTA_CHECK_DIR`, `$DELTA_RUN_DIR`, and
 `$DELTA_CRITERION` exported.
 
@@ -75,12 +76,14 @@ Exit codes:
 | **2** | at least one criterion has no corresponding check |
 | **3** | at least one MANUAL criterion has no recorded sign-off |
 | **4** | could not run: no such change, no spec, or no criteria |
+| **5** | `--archive-gate` only: a reproduction is still outstanding |
+| **6** | a reproduction did not reproduce |
 
 Codes **2** and **3** are load-bearing. A criterion silently counted as passing
 makes the whole tool worthless, so "nothing ran for this" is a distinct,
 non-zero outcome — never a caveat attached to a pass.
 
-When several apply, the precedence is 1 > 2 > 3.
+When several apply, the precedence is 1 > 6 > 2 > 3 > 5.
 
 Every run writes `delta/changes/<id>/run/<utc-timestamp>/` containing a log per
 criterion, `results.tsv` (id, status, exit code, start time, duration),
@@ -110,6 +113,66 @@ technically executes — a check asserting an error string is non-empty, standin
 in for "the message is clear", turns an open question into a false green.
 
 The count of MANUAL criteria is itself signal about how testable the spec was.
+
+## Bug fixes: reproduction-first checks
+
+A bug fix doesn't begin with knowing what to build. The intent is "make this
+stop happening", the cause is unknown when you write the spec, and the most
+valuable check is one that **fails before the fix and passes after**.
+
+A check can say so:
+
+```sh
+#!/bin/sh
+# CRITERION: B1 duplicate webhook creates a second ledger row
+# EXPECT: fail-until-fixed
+```
+
+The default is `pass`, so a check with no `EXPECT` header behaves exactly as it
+always has.
+
+| state | when | exit |
+|---|---|---|
+| `reproduced` | a `fail-until-fixed` check fails | **0** — nothing is wrong; the bug is confirmed and the fix isn't written yet |
+| `fixed` | it passes, having been reproduced earlier | **0** — flips permanently to a normal check |
+| `suspicious` | it passes without ever having reproduced | **6** — the repro doesn't reproduce, so the criterion is wrong |
+
+A reproduction is the strongest check delta can hold. Feature criteria are
+aspirational; a repro is proof, written before the fix, and once it flips it
+stays in `checks/` as a permanent regression guard.
+
+### The flip is recorded
+
+When a reproduction is confirmed and later fixed, `verify` writes to
+`delta/changes/<id>/run/reproductions.md` — tracked in git, unlike the per-run
+directories, because it has to survive a fresh clone:
+
+```
+B1 reproduced: 2026-08-26T14-02-31 - exit 1
+B1 fixed: 2026-08-26T16-40-09 - reproduced 2026-08-26T14-02-31
+```
+
+That pair of lines is the evidence the fix worked: the check failed before it
+and passes after. The flip also rewrites the check's own `EXPECT` line, so the
+file records what happened to it.
+
+### Why `suspicious` is a distinct state
+
+A reproduction that passes the first time never captured the bug. Silently
+accepting it would let someone "fix" a bug they never reproduced — which is the
+failure mode the whole feature exists to prevent. So it isn't a pass, and it
+isn't a failure either: it's its own state, with its own exit code.
+
+### Archiving is gated
+
+An outstanding reproduction exits 0 on a normal run — correct, nothing is
+wrong. But `archive` runs `delta/bin/verify --archive-gate`, which exits **5**
+and names the outstanding criteria, because folding a bug delta into truth
+while its reproduction still reproduces would record a bug as fixed that isn't.
+
+There is deliberately **no `/delta:bug` command.** This is the same five-command
+lifecycle with one additional check state; a parallel command set for bugs
+would duplicate everything and drift.
 
 ## Layout
 
@@ -213,8 +276,9 @@ agent ran the command to completion rather than drifting off mid-way.
   Δ ──────  4 criteria · 2 passed · 1 failed · 1 manual · 1.5s
 ```
 
-Glyphs: `✓` passed, `✗` failed, `○` manual, `·` pending, braille spinner while
-running. Green pass, red fail, dim for pending and manual. Results stream as
+Glyphs: `✓` passed, `✗` failed, `◆` reproduced, `!` suspicious, `○` manual,
+`·` pending, braille spinner while running. Green pass, red fail and suspicious,
+dim for pending and manual, default for reproduced — it is neither. Results stream as
 each check finishes; failure detail prints above the summary with its log path,
 so the summary is what stays on screen.
 
@@ -225,9 +289,9 @@ Degradation is a requirement, not polish:
   tee` and CI logs stay readable.
 - **`NO_COLOR` set** — no colour regardless of TTY.
 - **non-UTF-8 locale** — ASCII throughout: `d` for `Δ`, `-` for `─`, and
-  `[ok]` `[FAIL]` `[man]` `...` for the glyphs. Detected from `LC_ALL`/`LANG`.
-- **narrow terminal** — descriptions truncate rather than wrap, columns stay
-  aligned, and the frame never wraps to a second line.
+  `[ok]` `[FAIL]` `[rep]` `[!!]` `[man]` `...` for the glyphs. Detected from `LC_ALL`/`LANG`.
+- **narrow terminal** — descriptions and detail lines truncate rather than
+  wrap, columns stay aligned, and the frame never wraps to a second line.
 
 ## Verifying delta itself
 
