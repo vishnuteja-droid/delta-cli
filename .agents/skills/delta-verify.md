@@ -53,7 +53,7 @@ sh -c '
 
   runner="$root/delta/bin/verify"
   if [ ! -f "$runner" ]; then
-      echo "$runner does not exist - copy delta/bin/verify in from a repo that already has delta, commit it, then re-run" >&2
+      echo "$runner does not exist - copy delta/bin/verify AND delta/bin/palette.sh in from a repo that already has delta, commit both, then re-run" >&2
       exit 4
   fi
 
@@ -71,7 +71,7 @@ criterion.
 
 This is the one command in the lifecycle where a model must not participate in
 the judgement about pass or fail. The runner prints its own frame, its own
-results, and its own summary. It exits with a code from 0 to 6, and that exit
+results, and its own summary. It exits with a code from 0 to 7, and that exit
 code is the answer.
 
 Do not:
@@ -104,11 +104,17 @@ change is not done, and the next step belongs to whoever reads the failure.
   change into truth would record a bug as fixed that isn't.
 - **6** — a `fail-until-fixed` check passed without ever having failed first.
   The reproduction doesn't reproduce, so the criterion is wrong.
+- **7** — at least one check could not run at all: missing executable bit, or
+  a shebang naming an interpreter that is missing or not itself executable.
+  Distinct from a failure — the check never ran, so it has nothing to say
+  about the criterion. Fix the check (usually `chmod +x`), don't debug
+  application code over it.
 
 Codes 2 and 3 exist because a criterion silently counted as passing is worse
 than a criterion that fails loudly. Never describe a 2 or a 3 as "passing with
 caveats". Nothing ran. Code 6 exists for the same reason: a bug "fixed" by a
-reproduction that never reproduced is a false green, not a win.
+reproduction that never reproduced is a false green, not a win. Code 7 exists
+so a check that never ran is never mistaken for one that ran and failed.
 
 ## Signature frame
 

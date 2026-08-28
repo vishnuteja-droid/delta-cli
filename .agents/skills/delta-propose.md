@@ -122,17 +122,21 @@ Replace everything below with your own rules.
    either: `delta/bin/verify` is committed in every repo that has it, and
    that repo's own copy is the only one that ever exists. If it is missing,
    say so plainly and tell the user to copy it in from another repository
-   that already has delta set up — one file, one command, for example:
+   that already has delta set up — two files, no more, for example:
 
    ```sh
    cp path/to/other/repo/delta/bin/verify delta/bin/verify
+   cp path/to/other/repo/delta/bin/palette.sh delta/bin/palette.sh
    chmod +x delta/bin/verify
    ```
 
-   Do not fabricate the file's contents to route around this. Continue with
-   the rest of this step regardless — `truth/`, `changes/`, and the
-   constitution do not depend on the runner being present yet — but `verify`
-   will not work until it is.
+   `delta/bin/verify` sources `delta/bin/palette.sh` unconditionally, so
+   copying `verify` without it fails with a raw shell error rather than a
+   clean one — both files travel together. Do not fabricate either file's
+   contents to route around this. Continue with the rest of this step
+   regardless — `truth/`, `changes/`, and the constitution do not depend on
+   the runner being present yet — but `verify` will not work until both
+   files are.
 
 4. Say, in one line, that `delta/` was created and needs to be committed —
    the checks and truth you are about to write only survive a clone if it is,

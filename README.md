@@ -1,77 +1,50 @@
 # delta
 
-A spec-driven lifecycle for changing systems that already exist.
+A spec-driven lifecycle for changing systems that already exist: understand
+the code before proposing a change, then prove it worked by running
+something, not by asking a model whether it looks right. Five commands:
+**explore** reads the code, **propose** writes a spec plus one check per
+acceptance criterion, **apply** implements it, **verify** runs the checks,
+**archive** folds the result into truth — the next change diffs against what
+`archive` recorded, not against history.
 
-Two things it adds to what a coding agent does by default: understanding the
-code *before* proposing a change to it, and proving the change worked by
-*running something* rather than asking a model whether it looks right.
+No binary, no compile step, no Python, no Node, no package manager — the
+runner is POSIX `sh`. **Windows needs Git Bash** (bundled with Git for
+Windows, and unlike WSL it shares the Windows filesystem).
 
-Neither is novel on its own — codebase-onboarding skills exist, spec lifecycles
-exist. The loop is what doesn't: explore feeds propose, propose compiles
-checks, verify runs them, archive folds the result back into truth, and the
-next change diffs against reality instead of history.
-
-## Nothing is installed except the commands, once
-
-No binary, no compile step, no Python, no Node, no package manager. The five
-commands install once per machine — not once per repo — with a single script;
-every repo's own data (`truth/`, `changes/`, the constitution) is created
-lazily, by the tool itself, the first time you actually use it there.
-
-**Windows needs Git Bash.** The runner is `sh`, not PowerShell. Anyone who can
-clone a repo already has Git for Windows, which bundles it, and — unlike
-WSL — it shares the Windows filesystem, so there is no separate-filesystem
-split to work around. WSL works too, but Git Bash is the one with no gap.
-
-## Installing delta on this machine
-
-Clone this repository once, then:
+## Install
 
 ```sh
 delta/bin/install
 ```
 
-That writes the five commands into every supported CLI's personal command
-directory — `~/.claude/commands/`, `~/.gemini/commands/`, …, from the table in
-`adapters.yaml`. Nothing else. It copies files that already exist in this
-checkout — no network fetch, nothing else installed. Safe to re-run any time.
+Writes the five command files into every supported CLI's personal command
+directory (`~/.claude/commands/`, `~/.gemini/commands/`, …) once per machine,
+not once per repo. Copies files already in this checkout; no network fetch,
+nothing else installed. Safe to re-run any time; `rm -rf` those directories to
+uninstall. From then on, `/delta-explore` works in **any** repository on this
+machine, including one that has never seen delta.
 
-From then on, `/delta-explore` (or `/delta:explore` in Gemini CLI) works in
-**any** repository on this machine, including one that has never seen delta.
-Adding delta to a repository is nothing more than running `propose` in it once
-— see [Lazy per-repo data](#lazy-per-repo-data) below.
+`delta/bin/verify` is deliberately **not** part of what `install` writes: it
+is committed inside each repository — the only copy that ever exists, nothing
+tracks a version of it. A repo gets it the way it gets any other file: copied
+in from a repo that already has delta. See [Lazy per-repo
+data](#lazy-per-repo-data).
 
-`delta/bin/verify` is **not** part of what `install` writes, on purpose: it is
-committed in each repository, and that committed copy is the only one that
-ever exists. A repo that wants delta gets `delta/bin/verify` the same way it
-gets any other file — copied in from a repo that already has it, once, then
-committed. There is no global runner and nothing tracks a version of one.
-
-A repo can still commit its own project-level command files (in `.claude/commands/`,
-etc.) to pin or customise a variant for its team — that copy wins over the
-one `install` wrote, in every listed CLI. `install` is what makes the commands
-available before a repo has opted into anything; it is never the only path.
-
-To uninstall: `rm -rf` the personal command directories `install` printed
-above. No repository is touched by installing or uninstalling either one.
-
-## The five commands
+## Five commands
 
 | command | what it does |
 |---|---|
-| `explore <area>` | Read the affected code. Write entry points, call chain, data touched, and explicitly what could not be determined. |
-| `propose <intent>` | A delta spec against current truth — ADDED / MODIFIED / REMOVED / RENAMED — plus one executable check per acceptance criterion. Presented as a diff; nothing lands unapproved. |
+| `explore <area>` | Read the affected code. Write entry points, call chain, data touched, and what could not be determined. |
+| `propose <intent>` | A spec against current truth — ADDED / MODIFIED / REMOVED / RENAMED — plus one check per criterion. Presented as a diff; nothing lands unapproved. |
 | `apply` | Implement the spec in order, marking progress. |
-| `verify` | Run `delta/bin/verify`. No model involvement at all. |
+| `verify` | Run `delta/bin/verify`. No model involvement. |
 | `archive` | Fold the applied delta into truth. |
-
-How you invoke them depends on your CLI — `/delta-explore` in Claude Code,
-`/delta:explore` in Gemini CLI. See [Working with any CLI](#working-with-any-cli).
 
 ## A check is an executable file
 
-Not a description, not a prompt, not a YAML entry. A file with a shebang that
-exits 0 or non-zero:
+Not a description, not a YAML entry — a shebang file that exits 0 or non-zero,
+bound to a criterion by filename prefix (`checks/C3-*` serves `C3`):
 
 ```sh
 #!/bin/sh
@@ -80,485 +53,147 @@ curl -sf -X POST localhost:8081/webhook/retry -d @fixtures/dup.json > /dev/null
 test "$(psql -tAc "select count(*) from ledger_entry where provider_ref='X1'")" = "1"
 ```
 
-The runner needs no knowledge of check types, because every check is just a
-program: curl, psql, mvn, npm, jq, `gh` — whatever is already on the machine.
+Most checks are thin wrappers over existing tests — that's correct. `chmod +x`
+it the moment you write it (write-a-file tools leave the bit off); without it
+a check reports as [`error`](#running-verify). `.gitattributes` forces LF on
+`delta/bin/**` and `**/checks/**` — a `\r`-terminated shebang isn't one.
 
-A check is bound to a criterion by filename prefix: `checks/C3-*` serves
-criterion `C3`. An id is an uppercase prefix and a number, so a bug spec can
-number its reproductions `B1`, `B2`. Checks run with the working directory at the repository root,
-with `$DELTA_CHANGE_DIR`, `$DELTA_CHECK_DIR`, `$DELTA_RUN_DIR`, and
-`$DELTA_CRITERION` exported.
-
-### What a check is *for*
-
-Not to catch what the test suite misses — that's the test suite's job. A check
-binds a stated criterion to a proof that ran. A check whose entire body is
-`mvn test -Dtest=WebhookTest#idempotent` is a good check: the value is the
-mapping, and the fact that an agent cannot declare the work done without it.
-Expect most checks to be thin wrappers over existing tests. That's correct.
-
-### Portability
-
-`chmod +x` a check the moment you write it — `test`, `curl`, and every other
-write-a-file tool leaves the executable bit off by default, and a check
-without it is reported as an [error, not a failure](#errors-are-not-failures)
-but still wastes a run.
-
-`.gitattributes` forces LF line endings on `delta/bin/**` and `**/checks/**`:
-a shebang followed by `\r` is not the shebang the kernel is looking for, so a
-checkout with CRLF line endings breaks every shell script in the tree,
-regardless of platform.
-
-The runner itself sticks to constructs that exist identically on both BSD
-userland (macOS) and GNU userland (Linux) — no `sed -i`, no `readlink -f`, no
-`date -d`, no `grep -P`, no arrays, no `[[`, no process substitution. That is
-portability by not needing the divergent form, rather than by branching on
-`uname`: macOS and Linux share the one code path, with no platform logic in
-it at all. Reaching for any of the constructs above while touching `delta/bin/`
-is the signal that the script got clever; there's almost always a plain `[ ]`
-and a temp file that does the same job everywhere.
-
-## Running it
+## Running verify
 
 ```sh
-delta/bin/verify [change-id]          # defaults to the most recent change
-delta/bin/verify path/to/change/dir   # anything with a slash is a path
-DELTA_ROOT=/path/to/repo delta/bin/verify [change-id]   # override root discovery
+delta/bin/verify [change-id]        # defaults to the most recent change
+DELTA_ROOT=/path/to/repo delta/bin/verify [change-id]
 ```
 
-Root discovery: the script normally resolves its root from its own location —
-it lives at `<root>/delta/bin/verify`, so that already works from any cwd.
-`DELTA_ROOT` overrides it explicitly. When the resolved root isn't the current
-directory, the run announces it (`root: /path/to/repo`) before anything else.
+| exit | meaning | what to do |
+|---|---|---|
+| **0** | every criterion checked, every check passed, every MANUAL signed off | done |
+| **1** | a check failed | fix the code, or the check if it's wrong |
+| **2** | a criterion has no check | write one — never a caveat on a pass |
+| **3** | a MANUAL criterion has no sign-off | add a line to `run/signoff.md` |
+| **4** | could not run — bad change id, no `spec.md`, no criteria, bad `$DELTA_ROOT` | the printed message says which |
+| **5** | `--archive-gate` only: a reproduction is still outstanding | fix the bug, don't archive around it |
+| **6** | a `fail-until-fixed` check passed without ever failing | the reproduction is wrong — fix it |
+| **7** | a check could not run at all (not executable, bad interpreter) | never a criterion failure — fix the check |
 
-Exit codes:
+When several apply, precedence is `7 > 1 > 6 > 2 > 3 > 5` (see the header
+comment in `delta/bin/verify`). Every run writes
+`delta/changes/<id>/run/<utc-timestamp>/`: a log per criterion, `results.tsv`,
+`meta.txt`, `summary.txt`.
 
-| code | meaning |
-|---|---|
-| **0** | every criterion has a check, every check passed, every MANUAL criterion signed off |
-| **1** | at least one check failed |
-| **2** | at least one criterion has no corresponding check |
-| **3** | at least one MANUAL criterion has no recorded sign-off |
-| **4** | could not run: no such change, no spec, or no criteria |
-| **5** | `--archive-gate` only: a reproduction is still outstanding |
-| **6** | a reproduction did not reproduce |
-| **7** | at least one check could not run at all — see below |
+## MANUAL criteria
 
-Codes **2** and **3** are load-bearing. A criterion silently counted as passing
-makes the whole tool worthless, so "nothing ran for this" is a distinct,
-non-zero outcome — never a caveat attached to a pass.
-
-When several apply, the precedence is 7 > 1 > 6 > 2 > 3 > 5.
-
-### Errors are not failures
-
-A check that could not run — missing executable bit, a shebang naming an
-interpreter that is missing or not itself executable — is a distinct `error`
-state, exit **7**, never folded into `failed`. The check never ran, so it has
-nothing to say about whether the criterion holds; counting it as a failure
-sends someone to debug application code that is fine. `verify` detects this
-two ways: the executable bit, checked before a check ever runs, and exit
-codes 126/127 (permission denied / command not found), the shell's own
-convention for "could not execute this at all", checked after.
-
-Every run writes `delta/changes/<id>/run/<utc-timestamp>/` containing a log per
-criterion, `results.tsv` (id, status, exit code, start time, duration),
-`meta.txt`, and `summary.txt`.
-
-### MANUAL criteria
-
-Some acceptance criteria are real and unautomatable — "error messages are clear
-to support staff", "the retry doesn't hammer the downstream". Mark them
-`MANUAL` in the spec with a reason and what a human should look at:
-
-```
-- C4 MANUAL error messages are readable by support staff
-      reason: judgement about wording, with no assertable output
-      look at: the three error strings in WebhookController
-```
-
-`verify` lists them separately and never counts them as passed. Resolving one
-takes a line in `delta/changes/<id>/run/signoff.md`:
+Real, unautomatable criteria are marked `MANUAL` with a reason. `verify`
+never auto-passes one; it needs a sign-off line in `run/signoff.md`:
 
 ```
 C4 signed-off-by: alex 2026-08-26 - read all three, each names the next action
 ```
 
-Never auto-pass a MANUAL criterion, and never write a weak proxy check so it
-technically executes — a check asserting an error string is non-empty, standing
-in for "the message is clear", turns an open question into a false green.
-
-The count of MANUAL criteria is itself signal about how testable the spec was.
+Never write a weak proxy check so it technically executes — that turns an
+open question into a false green.
 
 ## Bug fixes: reproduction-first checks
 
-A bug fix doesn't begin with knowing what to build. The intent is "make this
-stop happening", the cause is unknown when you write the spec, and the most
-valuable check is one that **fails before the fix and passes after**.
+The first criterion of a bug fix is the reproduction: `# EXPECT: fail-until-fixed`,
+expected to fail before the fix lands:
 
-A check can say so:
+- `reproduced` (exit 0) — fails as expected, bug confirmed, fix not written
+- `fixed` (exit 0) — passes, having reproduced earlier; flips permanently
+- `suspicious` (exit 6) — passes without ever having reproduced; the repro is wrong
 
-```sh
-#!/bin/sh
-# CRITERION: B1 duplicate webhook creates a second ledger row
-# EXPECT: fail-until-fixed
-```
-
-The default is `pass`, so a check with no `EXPECT` header behaves exactly as it
-always has.
-
-| state | when | exit |
-|---|---|---|
-| `reproduced` | a `fail-until-fixed` check fails | **0** — nothing is wrong; the bug is confirmed and the fix isn't written yet |
-| `fixed` | it passes, having been reproduced earlier | **0** — flips permanently to a normal check |
-| `suspicious` | it passes without ever having reproduced | **6** — the repro doesn't reproduce, so the criterion is wrong |
-
-A reproduction is the strongest check delta can hold. Feature criteria are
-aspirational; a repro is proof, written before the fix, and once it flips it
-stays in `checks/` as a permanent regression guard.
-
-### The flip is recorded
-
-When a reproduction is confirmed and later fixed, `verify` writes to
-`delta/changes/<id>/run/reproductions.md` — tracked in git, unlike the per-run
-directories, because it has to survive a fresh clone:
-
-```
-B1 reproduced: 2026-08-26T14-02-31 - exit 1
-B1 fixed: 2026-08-26T16-40-09 - reproduced 2026-08-26T14-02-31
-```
-
-That pair of lines is the evidence the fix worked: the check failed before it
-and passes after. The flip also rewrites the check's own `EXPECT` line, so the
-file records what happened to it.
-
-### Why `suspicious` is a distinct state
-
-A reproduction that passes the first time never captured the bug. Silently
-accepting it would let someone "fix" a bug they never reproduced — which is the
-failure mode the whole feature exists to prevent. So it isn't a pass, and it
-isn't a failure either: it's its own state, with its own exit code.
-
-### Archiving is gated
-
-An outstanding reproduction exits 0 on a normal run — correct, nothing is
-wrong. But `archive` runs `delta/bin/verify --archive-gate`, which exits **5**
-and names the outstanding criteria, because folding a bug delta into truth
-while its reproduction still reproduces would record a bug as fixed that isn't.
-
-There is deliberately **no `/delta:bug` command.** This is the same five-command
-lifecycle with one additional check state; a parallel command set for bugs
-would duplicate everything and drift.
+The flip is recorded in `delta/changes/<id>/run/reproductions.md`, tracked in
+git so it survives a clone. `archive`'s `--archive-gate` exits 5 while a
+reproduction is outstanding, so archiving can't record a bug as fixed that
+isn't. No `/delta:bug` command — same lifecycle, one extra check state.
 
 ## Layout
 
-Per repository — created lazily by `propose`, the first time it runs there,
-and committed from then on. `delta/bin/verify` is a real, committed file, not
-generated or copied in automatically by anything:
+Per repository, created lazily by `propose`. `bin/verify` and `bin/palette.sh`
+are real, committed files, never generated:
 
 ```
 delta/
-  constitution.md          hand-written, inherited by every change
-  bin/verify               committed - the only copy of the runner that exists
-  bin/palette.sh           colours and glyphs, the only place either live
-  bin/report               reads run/, writes delta/report.html (see below)
-  truth/                   current understanding; only archive writes here
-  changes/<id>/
-    explore.md             findings, including known unknowns
-    spec.md                the delta spec
-    checks/                executable files, one per criterion
-    run/                   results per verification run
+  constitution.md                 hand-written, inherited by every change
+  bin/verify                      committed - the only copy that exists
+  bin/palette.sh                  colours/glyphs verify and report share
+  bin/report                      optional - writes delta/report.html
+  truth/                          current understanding; archive writes here
+  changes/<id>/explore.md
+  changes/<id>/spec.md
+  changes/<id>/checks/
+  changes/<id>/run/
 ```
 
-Per machine — written once by `delta/bin/install`, and nowhere else:
+Per machine, written once by `delta/bin/install`:
 
 ```
-~/.claude/commands/delta-*.md      (and the equivalent for every adapters.yaml entry)
-
-delta/                        this checkout only - the canonical source install reads from
-  adapters.yaml                CLI format table
-  bin/install                  writes the above - commands only, nothing else
-  bin/generate-commands        emits per-CLI files from the table (--target project|user)
-  commands/                    canonical command source, one file each
+~/.claude/commands/delta-*.md    (and the equivalent per adapters.yaml entry)
+delta/adapters.yaml               this checkout - the CLI format table
+delta/bin/install                 writes the above - commands only
+delta/bin/generate-commands       emits per-CLI files (--target project|user)
+delta/commands/                   canonical command source, one file each
 ```
 
 ## Lazy per-repo data
 
-There is no `init` command. The first time `propose` runs in a repository —
-found by walking up from the current directory for a `delta/` and, failing
-that, for a `.git`, the same way git resolves its own root — it creates
+No `init` command. The first time `propose` runs in a repository — root found
+by walking up for `delta/`, then `.git`, honouring `$DELTA_ROOT` — it creates
 `delta/{truth,changes,bin}` and writes `delta/constitution.md` from the
-template verbatim. It does not create `delta/bin/verify`: there is no global
-copy to pull one from, so it checks whether the file already exists and, if
-not, says so plainly and tells you to copy it in from a repo that already has
-delta — one file, one command. It then says, in one line, that `delta/` was
-created and needs to be committed.
-
-`explore` is the one command that works before any of that exists: point it
-at a repository that has never run `propose` and it still reads the code and
-prints findings — to the terminal, since there is nowhere to write them yet.
-It never creates `delta/` itself; only `propose` does, and only when it needs
-to.
-
-Every command resolves its root the same way, honouring `DELTA_ROOT` as an
-explicit override, and says so when the resolved root isn't the current
-directory:
-
-```
-root: /path/to/repo
-```
-
-That means every command works from any subdirectory of a repo, not just its
-root — the same way `git status` works from three directories deep.
-
-A teammate who clones a repo that already has `delta/` needs none of this at
-all: `delta/bin/verify` is a committed file, exactly like any other file in
-the repo, so `verify` runs correctly with no install on that machine, no
-global state, and nothing to compare a version against. The checks and the
-runner that executes them travel together in the same commit and cannot
-disagree.
+template. It does not create `delta/bin/verify`: no global copy to pull
+from, so it says to copy `delta/bin/verify` **and** `delta/bin/palette.sh`
+in — verify sources palette.sh unconditionally, so one without the other
+fails to start. A teammate cloning a repo with `delta/` already needs none
+of this: the runner is a committed file, nothing to compare a version against.
 
 ## The constitution
 
-One hand-written file, under 60 lines, inherited by every change.
-Non-negotiables only: layering rules, what must never be touched, error and
-logging conventions.
-
-Litmus test per line: *would removing this line cause an agent to make a
-mistake it would not otherwise make?* If not, delete it.
-
-There is deliberately **no `init` that generates it by introspecting the
-repo.** Auto-generated context files reduce agent success and raise cost;
-hand-written ones improve both. `propose` writes the exact same template —
-prompts, not a generator — the first time it runs in a repository; nothing
-about that changes what goes in it. Replace it with your own rules before the
-first real change lands.
+One hand-written file, under 60 lines, non-negotiables only, inherited by
+every change. `propose` writes the template verbatim the first time it runs
+in a repo — no generator introspects the codebase to fill it in. Replace it
+with your own rules before the first real change lands.
 
 ## Working with any CLI
 
-Adapters are data, not code. `delta/commands/` holds one canonical file per
-command; `delta/adapters.yaml` describes each target's project-level `dir`
-*and* machine-level `user_dir`, extension, and wrapper format;
-`delta/bin/generate-commands` emits the per-tool files.
-
-```sh
-delta/bin/generate-commands                    # project-level, all adapters - the default, committed
-delta/bin/generate-commands claude              # project-level, just one
-delta/bin/generate-commands --check             # CI: fail if committed project-level output is stale
-delta/bin/generate-commands --target user       # machine-level, under $HOME - what install calls
-```
-
-Project-level output is what a team commits to pin or customise a variant; it
-still wins over the machine-level copy in every listed CLI. Machine-level
-output, written by `delta/bin/install`, is what makes the commands available
-before a repo has opted into anything at all.
-
-**Adding a CLI is an entry in `adapters.yaml`. It is never a code change.**
-That's the property being built for: this landscape churns, and an adapter
-written as a code module rots every time a vendor moves a directory.
-
-Shipped entries, each verified against that tool's current documentation
-rather than from memory:
+`delta/commands/` holds one canonical file per command; `delta/adapters.yaml`
+describes each target's format; `delta/bin/generate-commands` emits the
+per-tool files (`--check` fails CI on stale output). Adding a CLI is a table
+entry, never a code change.
 
 | tool | directory | format | invoked as |
 |---|---|---|---|
-| Claude Code | `.claude/commands/` | markdown + YAML front matter | `/delta-explore` |
+| Claude Code | `.claude/commands/` | markdown + front matter | `/delta-explore` |
 | Gemini CLI | `.gemini/commands/delta/` | TOML | `/delta:explore` |
 | Antigravity CLI | `.agents/skills/` | markdown + front matter | `/delta-explore` |
 | Codex | `.codex/prompts/` | markdown + front matter | `/delta-explore` |
 
-Two notes worth knowing, both recorded in `adapters.yaml`:
+[`AGENTS.md`](AGENTS.md) is the durable, vendor-neutral target the per-CLI
+files layer over. `gh`/`glab` are ordinary check-callable programs; delta
+builds no forge integration.
 
-- **Claude Code** files are emitted flat with a `delta-` prefix rather than in
-  a `delta/` subdirectory: the docs define a command's name as its file name
-  without extension, and subdirectory namespacing has a standing bug report.
-- **Codex** loads prompts from `$CODEX_HOME/prompts` only — project-scoped
-  `.codex/prompts` is an open feature request, not a shipped feature. The files
-  are emitted anyway so they're versioned and reviewable, and so they work
-  unchanged if it lands. Today, Codex picks up the lifecycle from `AGENTS.md`.
-  To get the slash commands too:
-  `ln -s "$PWD/.codex/prompts"/delta-*.md ~/.codex/prompts/`
+## Terminal presentation and the telemetry report
 
-### AGENTS.md is the durable target
+`verify` prints its own frame and streams results as each check finishes,
+degrading honestly: no colour off a TTY or with `NO_COLOR`, ASCII glyphs off
+UTF-8, truncation instead of wrapping on a narrow terminal. Colours/glyphs
+live in `delta/bin/palette.sh` (see its header), shared with `delta/bin/report`.
 
-[`AGENTS.md`](AGENTS.md) is hand-written and carries the lifecycle in about
-fifteen lines. It's the open standard formalised in August 2025, donated to the
-Linux Foundation in December 2025, and supported by 20+ tools — and it isn't
-owned by a vendor. The per-CLI command files are a convenience layer over it.
-
-### Not integration targets
-
-`gh` and `glab` are ordinary programs a check can call if a criterion needs
-them. delta builds no forge integration.
-
-## Terminal presentation
-
-`verify` prints for itself. The other four are agent output, so their
-presentation is instructed rather than executed — which makes the signature
-frame both a signature and a compliance check: a closing frame is evidence the
-agent ran the command to completion rather than drifting off mid-way.
-
-```
-  Δ ─────────────────────────────  delta verify · webhook-idempotency
-
-  ✓ C1  retry returns 200                      0.4s
-  ✗ C3  duplicate creates no second row        0.6s
-  ○ C4  errors readable by support               manual
-
-  ✗ C3  expected 1 row, got 2
-        run/2026-08-26T14-02-31/C3.log
-
-  Δ ──────  4 criteria · 2 passed · 1 failed · 1 manual · 1.5s
-```
-
-Glyphs: `✓` passed, `✗` failed, `◆` reproduced, `!` suspicious, `⚠` error
-(could not run), `○` manual, `·` pending, braille spinner while running.
-Green pass, red fail/suspicious/error, dim for pending and manual, default
-for reproduced — it is neither. Results stream as each check finishes;
-failure detail prints above the summary with its log path, so the summary is
-what stays on screen.
-
-Degradation is a requirement, not polish:
-
-- **not a TTY** — no colour, no spinner, no carriage-return rewriting, one
-  plain line per result. The frame stays; it's the signature. `delta verify |
-  tee` and CI logs stay readable.
-- **`NO_COLOR` set** — no colour regardless of TTY.
-- **non-UTF-8 locale** — ASCII throughout: `d` for `Δ`, `-` for `─`, and
-  `[ok]` `[FAIL]` `[rep]` `[!!]` `[err]` `[man]` `...` for the glyphs. Detected from `LC_ALL`/`LANG`.
-- **narrow terminal** — descriptions and detail lines truncate rather than
-  wrap, columns stay aligned, and the frame never wraps to a second line.
-
-### Presence
-
-A tool people run twenty times a day should feel like something is
-happening, not print a frame and go quiet. While a check runs, one line
-updates in place — a verb, the check, and how long:
-
-```
-    ⠹ running  C3 duplicate creates no second row         0:03
-```
-
-Recomputed every tick, not cached from when the run started, so a mid-run
-terminal resize doesn't leave the line corrupted or wrapped.
-
-On a truecolor terminal (`COLORTERM=truecolor` or `24bit`), the rule fades
-left to right from the accent colour to the dim foreground — the one purely
-decorative effect here, and it's the reason for the "degrades silently"
-rule: 256- and 16-colour terminals just get the plain flat rule, no error,
-no fallback glyph, nothing to notice.
-
-A clean run's closing frame prints in the accent colour; a failing run
-highlights only the specific non-zero counts in red — never the whole line,
-and the frame itself only when everything passed. One beat of visual
-difference for the distinction actually worth noticing at a glance.
-
-`INT`, `TERM`, and normal exit all restore cursor visibility and reset
-colour, unconditionally — a tool that leaves the cursor invisible after
-Ctrl-C stops being trusted fast. Confirmed by sending a real terminal
-interrupt byte into a live pty (not `kill -INT` on a PID, which doesn't
-reproduce how a terminal actually delivers Ctrl-C to a foreground process
-group) and reading the byte stream: cursor-show and colour-reset both
-appear immediately, and the process exits via the signal, not by finishing
-the check it was running. The one known gap: this reaches the check's own
-process reliably, but not a grandchild a check spawns internally (a check
-that itself runs `sleep`, say) — delta can't reach into an arbitrary
-check's own process tree. Rare, since most checks are one synchronous
-command, and worth knowing rather than quietly claiming perfect cleanup.
-
-Only `verify` gets any of this literally — it's a real process with real
-signal and terminal control. `explore`, `propose`, `apply`, and `archive`
-are agent-executed prompts, not processes: they can't trap a signal or
-truly rewrite a line in place with a running clock, and claiming otherwise
-would be asserting behaviour delta cannot verify across every host CLI.
-What they get instead is the same spirit, honestly: progress and results
-printed as the work happens rather than batched at the end, using a small
-set of verbs chosen to match what's actually happening (`reading`,
-`tracing`, `writing`) — never sampled for whimsy, since a verb that lies
-about the operation is worse than no verb.
-
-`propose`'s review screen — the one where a developer makes the most
-important decision in the lifecycle — renders the spec and every check as
-a real diff: fenced ` ```diff ` blocks, unified-diff form, one per file.
-Every terminal and editor that renders markdown already colours a `diff`
-fence correctly, which is more reliable than an agent emitting raw ANSI
-into a chat response and hoping it survives whatever the host does to it.
-
-### One palette, two surfaces
-
-`delta/bin/palette.sh` is the only file that defines a colour or a glyph —
-RGB triples, the portable 16-colour ANSI numbers, and the unicode/ASCII
-glyph pairs. `delta/bin/verify` (terminal) and `delta/bin/report` (HTML)
-both source it and derive what they need (`palette_hex` for CSS,
-`palette_ansi_truecolor` for the gradient); neither hardcodes a colour of
-its own. The point: the same run has to look like the same run whether you
-watched it happen or opened the HTML report afterward. Passed and fixed are
-green in both; failed, suspicious, and error are red in both; manual and
-pending are dim in both; reproduced is the plain foreground in both — not
-approximately matching colours picked twice, the same values read once.
+`delta/bin/report` reads `delta/changes/*/run/` and writes a self-contained
+`delta/report.html`: usage, failure rate, testability, recurring failures,
+aggregate only, no per-developer data, no server, no JavaScript, gitignored
+like the `run/` data it's generated from.
 
 ## Verifying delta itself
 
 `delta/changes/example-verify-exit-codes/` is both the worked example of the
-spec format and delta's own test suite: its checks run the runner against
-throwaway fixtures and assert each exit code.
+spec format and delta's own test suite:
 
 ```sh
 delta/bin/verify example-verify-exit-codes
 ```
 
-## The telemetry report
-
-The live workflow UI stays deferred — a static page can't carry buttons or
-stream a run, and every fix for that costs a runtime dependency. Telemetry is
-different: it's entirely backward-looking, so a generated file is the
-correct shape, not a compromise.
-
-```sh
-delta/bin/report
-```
-
-Reads `delta/changes/*/run/` and writes `delta/report.html`. Open it, read
-it, close it — no server, no dependency beyond the `sh`/`awk` `verify`
-already needs, no live anything. Four questions, nothing else:
-
-1. **Is delta being used?** — changes started/archived, verify runs, a
-   sparkline once there's enough history to call it one.
-2. **Does verification catch anything?** — the percentage of ordinary
-   criteria that failed on verify. This is the number the tool is built on:
-   direct evidence, not an assertion, that agents report completion they
-   can't substantiate. It accumulates from runs you're already doing,
-   whether or not anyone opens the report.
-3. **How testable are our specs?** — criteria that compiled to a check vs
-   MANUAL, per change, oldest first.
-4. **What keeps breaking?** — criteria that failed more than once; bug
-   reproductions that took several attempts to turn green.
-
-Same honest-counting rules as `verify` itself: MANUAL is never a failure, a
-check that couldn't run is never mixed with one that failed to hold. Below
-`--min-runs` (default 5) the trend charts are replaced with a plain
-statement that there isn't enough history yet — the underlying numbers
-still show, since a single real data point isn't a fabricated trend. No
-`run/` data at all produces a valid, themed page saying so, not an error.
-
-Aggregate only, by design: no author, username, or per-developer anything,
-anywhere in the script or its output. If delta spreads, a per-developer
-breakdown is the fastest way to make people stop using it.
-
-Charts are inline SVG the script writes itself — no library, no CDN, no web
-font, no JavaScript. `delta/report.html` opens over `file://` with zero
-network requests, and is gitignored: it's generated from already-gitignored
-`run/` data, local history regenerated on demand, not source.
-
-**On the palette:** this reads "the shared palette defined in CR-004" in its
-own originating spec, but no such artifact exists in this repository's
-history. The dark warm-black ground, terracotta accent, and monospace
-throughout are this repo's own concrete choice; the state colours are taken
-directly from `delta/bin/verify`'s actual `C_PASS`/`C_FAIL`/`C_DIM` scheme
-so the report reads as the same tool, not a redesign.
-
 ## Deliberately not built
 
-The live workflow UI — see above for why, and for what shipped instead. Also
-deferred: a code graph or impact analysis, an MCP server, multi-agent roles,
-and any hosted or networked component.
+A live workflow UI — a static page can't carry buttons or stream a run, and
+every fix costs a dependency delta otherwise has none of. Also deferred: a
+code graph, an MCP server, multi-agent roles, any networked component.

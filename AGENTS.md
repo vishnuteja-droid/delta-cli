@@ -5,9 +5,10 @@
 Changes to existing behaviour go through delta, a spec lifecycle that lives in
 `delta/`. The five commands install once per machine (`delta/bin/install`);
 `delta/` itself is created lazily, by `propose`, the first time it runs here —
-there is no separate init step. `delta/bin/verify` is committed in this repo;
-if it's missing, copy it in from a repo that has one rather than writing one
-from scratch — there is no global copy anywhere to fall back on.
+there is no separate init step. `delta/bin/verify` and `delta/bin/palette.sh`
+are committed in this repo; if either is missing, copy both in from a repo
+that has them rather than writing them from scratch — there is no global copy
+anywhere to fall back on, and `verify` will not start without `palette.sh`.
 
 1. **explore** — read the affected code and write findings to
    `delta/changes/<id>/explore.md`, including what could not be determined.
@@ -26,10 +27,12 @@ from scratch — there is no global copy anywhere to fall back on.
 Run `delta/bin/verify` before claiming any change is complete, and again after
 any change to the checks or the spec. It exits **0** all passed, **1** a check
 failed, **2** a criterion has no check, **3** a MANUAL criterion is unsigned,
-**6** a reproduction did not reproduce, **7** a check could not run at all
-(missing executable bit, bad interpreter) — that one is never a criterion
-failure, so don't debug application code over it; fix the check itself. Only
-0 means done. A non-zero exit is not a caveat to explain around.
+**4** it could not run at all (bad change id, no spec, no criteria — the
+message says which), **6** a reproduction did not reproduce, **7** a check
+could not run at all (missing executable bit, bad interpreter) — that one is
+never a criterion failure, so don't debug application code over it; fix the
+check itself. Only 0 means done. A non-zero exit is not a caveat to explain
+around.
 
 For a bug fix, write the reproduction first and mark its check
 `# EXPECT: fail-until-fixed`. It is expected to fail until the fix lands, so a
