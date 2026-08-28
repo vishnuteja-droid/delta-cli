@@ -18,7 +18,10 @@ commands install once per machine — not once per repo — with a single script
 every repo's own data (`truth/`, `changes/`, the constitution) is created
 lazily, by the tool itself, the first time you actually use it there.
 
-**Windows needs WSL or Git Bash.** The runner is `sh`, not PowerShell.
+**Windows needs Git Bash.** The runner is `sh`, not PowerShell. Anyone who can
+clone a repo already has Git for Windows, which bundles it, and — unlike
+WSL — it shares the Windows filesystem, so there is no separate-filesystem
+split to work around. WSL works too, but Git Bash is the one with no gap.
 
 ## Installing delta on this machine
 
@@ -29,23 +32,28 @@ delta/bin/install
 ```
 
 That writes the five commands into every supported CLI's personal command
-directory (`~/.claude/commands/`, `~/.gemini/commands/`, …, from the table in
-`adapters.yaml`) and copies the runner to `~/.delta/bin/verify`. It copies
-files that already exist in this checkout — no network fetch, nothing else
-installed. Safe to re-run any time.
+directory — `~/.claude/commands/`, `~/.gemini/commands/`, …, from the table in
+`adapters.yaml`. Nothing else. It copies files that already exist in this
+checkout — no network fetch, nothing else installed. Safe to re-run any time.
 
 From then on, `/delta-explore` (or `/delta:explore` in Gemini CLI) works in
 **any** repository on this machine, including one that has never seen delta.
 Adding delta to a repository is nothing more than running `propose` in it once
 — see [Lazy per-repo data](#lazy-per-repo-data) below.
 
+`delta/bin/verify` is **not** part of what `install` writes, on purpose: it is
+committed in each repository, and that committed copy is the only one that
+ever exists. A repo that wants delta gets `delta/bin/verify` the same way it
+gets any other file — copied in from a repo that already has it, once, then
+committed. There is no global runner and nothing tracks a version of one.
+
 A repo can still commit its own project-level command files (in `.claude/commands/`,
 etc.) to pin or customise a variant for its team — that copy wins over the
 one `install` wrote, in every listed CLI. `install` is what makes the commands
 available before a repo has opted into anything; it is never the only path.
 
-To uninstall: `rm -rf ~/.delta` and the personal command directories it wrote
-to. No repository is touched by installing or uninstalling either one.
+To uninstall: `rm -rf` the personal command directories `install` printed
+above. No repository is touched by installing or uninstalling either one.
 
 ## The five commands
 
@@ -89,6 +97,27 @@ binds a stated criterion to a proof that ran. A check whose entire body is
 mapping, and the fact that an agent cannot declare the work done without it.
 Expect most checks to be thin wrappers over existing tests. That's correct.
 
+### Portability
+
+`chmod +x` a check the moment you write it — `test`, `curl`, and every other
+write-a-file tool leaves the executable bit off by default, and a check
+without it is reported as an [error, not a failure](#errors-are-not-failures)
+but still wastes a run.
+
+`.gitattributes` forces LF line endings on `delta/bin/**` and `**/checks/**`:
+a shebang followed by `\r` is not the shebang the kernel is looking for, so a
+checkout with CRLF line endings breaks every shell script in the tree,
+regardless of platform.
+
+The runner itself sticks to constructs that exist identically on both BSD
+userland (macOS) and GNU userland (Linux) — no `sed -i`, no `readlink -f`, no
+`date -d`, no `grep -P`, no arrays, no `[[`, no process substitution. That is
+portability by not needing the divergent form, rather than by branching on
+`uname`: macOS and Linux share the one code path, with no platform logic in
+it at all. Reaching for any of the constructs above while touching `delta/bin/`
+is the signal that the script got clever; there's almost always a plain `[ ]`
+and a temp file that does the same job everywhere.
+
 ## Running it
 
 ```sh
@@ -113,12 +142,24 @@ Exit codes:
 | **4** | could not run: no such change, no spec, or no criteria |
 | **5** | `--archive-gate` only: a reproduction is still outstanding |
 | **6** | a reproduction did not reproduce |
+| **7** | at least one check could not run at all — see below |
 
 Codes **2** and **3** are load-bearing. A criterion silently counted as passing
 makes the whole tool worthless, so "nothing ran for this" is a distinct,
 non-zero outcome — never a caveat attached to a pass.
 
-When several apply, the precedence is 1 > 6 > 2 > 3 > 5.
+When several apply, the precedence is 7 > 1 > 6 > 2 > 3 > 5.
+
+### Errors are not failures
+
+A check that could not run — missing executable bit, a shebang naming an
+interpreter that is missing or not itself executable — is a distinct `error`
+state, exit **7**, never folded into `failed`. The check never ran, so it has
+nothing to say about whether the criterion holds; counting it as a failure
+sends someone to debug application code that is fine. `verify` detects this
+two ways: the executable bit, checked before a check ever runs, and exit
+codes 126/127 (permission denied / command not found), the shell's own
+convention for "could not execute this at all", checked after.
 
 Every run writes `delta/changes/<id>/run/<utc-timestamp>/` containing a log per
 criterion, `results.tsv` (id, status, exit code, start time, duration),
@@ -212,12 +253,13 @@ would duplicate everything and drift.
 ## Layout
 
 Per repository — created lazily by `propose`, the first time it runs there,
-and committed from then on:
+and committed from then on. `delta/bin/verify` is a real, committed file, not
+generated or copied in automatically by anything:
 
 ```
 delta/
   constitution.md          hand-written, inherited by every change
-  bin/verify               bootstrapped from ~/.delta/bin/verify, then committed
+  bin/verify               committed - the only copy of the runner that exists
   truth/                   current understanding; only archive writes here
   changes/<id>/
     explore.md             findings, including known unknowns
@@ -226,19 +268,14 @@ delta/
     run/                   results per verification run
 ```
 
-Per machine — written once by `delta/bin/install`, in this checkout and in
-`~/.delta/`, never inside any other repository:
+Per machine — written once by `delta/bin/install`, and nowhere else:
 
 ```
-~/.delta/
-  bin/verify                 canonical runner; repos bootstrap their own copy from this
-  constitution-template.md   convenience copy of delta/constitution.md
-
 ~/.claude/commands/delta-*.md      (and the equivalent for every adapters.yaml entry)
 
 delta/                        this checkout only - the canonical source install reads from
   adapters.yaml                CLI format table
-  bin/install                  writes the above
+  bin/install                  writes the above - commands only, nothing else
   bin/generate-commands        emits per-CLI files from the table (--target project|user)
   commands/                    canonical command source, one file each
 ```
@@ -248,9 +285,12 @@ delta/                        this checkout only - the canonical source install 
 There is no `init` command. The first time `propose` runs in a repository —
 found by walking up from the current directory for a `delta/` and, failing
 that, for a `.git`, the same way git resolves its own root — it creates
-`delta/{truth,changes,bin}`, writes `delta/constitution.md` from the template
-verbatim, and bootstraps `delta/bin/verify` from `~/.delta/bin/verify`. It
-then says, in one line, that `delta/` was created and needs to be committed.
+`delta/{truth,changes,bin}` and writes `delta/constitution.md` from the
+template verbatim. It does not create `delta/bin/verify`: there is no global
+copy to pull one from, so it checks whether the file already exists and, if
+not, says so plainly and tells you to copy it in from a repo that already has
+delta — one file, one command. It then says, in one line, that `delta/` was
+created and needs to be committed.
 
 `explore` is the one command that works before any of that exists: point it
 at a repository that has never run `propose` and it still reads the code and
@@ -269,12 +309,12 @@ root: /path/to/repo
 That means every command works from any subdirectory of a repo, not just its
 root — the same way `git status` works from three directories deep.
 
-A teammate who clones a repo that already has `delta/` needs none of this:
-`delta/bin/verify` is a committed file, so `verify` runs correctly with no
-install on that machine at all. If the repo's own runner is older than the
-machine's `~/.delta/bin/verify`, `verify` notes the mismatch — it never
-updates itself, because the thing that decides pass or fail must never change
-silently.
+A teammate who clones a repo that already has `delta/` needs none of this at
+all: `delta/bin/verify` is a committed file, exactly like any other file in
+the repo, so `verify` runs correctly with no install on that machine, no
+global state, and nothing to compare a version against. The checks and the
+runner that executes them travel together in the same commit and cannot
+disagree.
 
 ## The constitution
 
@@ -369,11 +409,12 @@ agent ran the command to completion rather than drifting off mid-way.
   Δ ──────  4 criteria · 2 passed · 1 failed · 1 manual · 1.5s
 ```
 
-Glyphs: `✓` passed, `✗` failed, `◆` reproduced, `!` suspicious, `○` manual,
-`·` pending, braille spinner while running. Green pass, red fail and suspicious,
-dim for pending and manual, default for reproduced — it is neither. Results stream as
-each check finishes; failure detail prints above the summary with its log path,
-so the summary is what stays on screen.
+Glyphs: `✓` passed, `✗` failed, `◆` reproduced, `!` suspicious, `⚠` error
+(could not run), `○` manual, `·` pending, braille spinner while running.
+Green pass, red fail/suspicious/error, dim for pending and manual, default
+for reproduced — it is neither. Results stream as each check finishes;
+failure detail prints above the summary with its log path, so the summary is
+what stays on screen.
 
 Degradation is a requirement, not polish:
 
@@ -382,7 +423,7 @@ Degradation is a requirement, not polish:
   tee` and CI logs stay readable.
 - **`NO_COLOR` set** — no colour regardless of TTY.
 - **non-UTF-8 locale** — ASCII throughout: `d` for `Δ`, `-` for `─`, and
-  `[ok]` `[FAIL]` `[rep]` `[!!]` `[man]` `...` for the glyphs. Detected from `LC_ALL`/`LANG`.
+  `[ok]` `[FAIL]` `[rep]` `[!!]` `[err]` `[man]` `...` for the glyphs. Detected from `LC_ALL`/`LANG`.
 - **narrow terminal** — descriptions and detail lines truncate rather than
   wrap, columns stay aligned, and the frame never wraps to a second line.
 

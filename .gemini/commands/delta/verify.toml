@@ -49,25 +49,19 @@ sh -c '
 
   runner="$root/delta/bin/verify"
   if [ ! -f "$runner" ]; then
-      if [ -f "$HOME/.delta/bin/verify" ]; then
-          mkdir -p "$root/delta/bin"
-          cp "$HOME/.delta/bin/verify" "$runner"
-          chmod +x "$runner"
-          echo "bootstrapped $runner from ~/.delta/bin/verify - commit it" >&2
-      else
-          echo "$runner is missing and this machine has no ~/.delta/bin/verify - run delta/bin/install first" >&2
-          exit 4
-      fi
+      echo "$runner does not exist - copy delta/bin/verify in from a repo that already has delta, commit it, then re-run" >&2
+      exit 4
   fi
 
   exec "$runner" {{args}}
 '
 ```
 
-That is the entire command. The bootstrap block above is file plumbing, not
-verification — it copies a program into place if it is not already there. It
-runs before the runner, never instead of it, and it makes no judgement about
-any criterion.
+That is the entire command. `delta/bin/verify` is committed in the repo —
+that is the only copy that ever exists, so there is nothing to bootstrap and
+nothing to compare a version against. The block above only locates the right
+root and hands off to that committed file; it makes no judgement about any
+criterion.
 
 ## Your role here is nothing
 
@@ -83,7 +77,7 @@ Do not:
 - assess whether the change "looks correct" despite a non-zero exit
 - re-run a failing check hoping for a different result
 - edit a check, for any reason
-- edit the bootstrap block above, or the runner it copies in
+- edit the root-finding block above, or the runner it hands off to
 
 Print the runner's output as it came out, and stop. If it exited non-zero, the
 change is not done, and the next step belongs to whoever reads the failure.

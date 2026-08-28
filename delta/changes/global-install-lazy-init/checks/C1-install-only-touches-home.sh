@@ -19,6 +19,10 @@ if [ "$before" != "$after" ]; then
     exit 1
 fi
 
-test -x "$fakehome/.delta/bin/verify" || { echo "install did not write the runner into HOME"; exit 1; }
-test -f "$fakehome/.delta/constitution-template.md" || { echo "install did not write the template into HOME"; exit 1; }
 test -f "$fakehome/.claude/commands/delta-explore.md" || { echo "install did not write claude commands into HOME"; exit 1; }
+test -f "$fakehome/.gemini/commands/delta/explore.toml" || { echo "install did not write gemini commands into HOME"; exit 1; }
+
+# Superseded by CR-002.R: install no longer writes a runner or a constitution
+# template anywhere. Confirm neither exists and nothing under .delta was
+# created at all - there is no global runner, ever.
+test ! -e "$fakehome/.delta" || { echo "install created \$HOME/.delta, which should no longer exist at all"; exit 1; }

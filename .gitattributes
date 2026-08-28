@@ -1,0 +1,6 @@
+# delta runs its shell scripts through a real interpreter, so a checkout with
+# CRLF line endings breaks every one of them - a shebang followed by \r is not
+# the shebang the kernel is looking for. Force LF regardless of platform or
+# git's autocrlf setting.
+delta/bin/** text eol=lf
+**/checks/** text eol=lf

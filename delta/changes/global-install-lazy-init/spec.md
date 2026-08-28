@@ -72,6 +72,17 @@ No package manager, no installer beyond a shell script, no network fetch -
 `install` copies files that already exist locally. No global state beyond
 `~/.delta/`; nothing about a repo is ever recorded outside that repo.
 
+## Superseded by CR-002.R
+
+CR-002.R reverted the runner-bootstrap machinery this change originally added:
+`~/.delta/bin/verify`, the copy-into-repo step on first propose, the version
+stamp, and the drift note. `delta/bin/verify` is committed in the repo; that
+is the only copy, always. The criteria below are edited to match - C7, which
+existed only to test the version-mismatch note, is removed outright; C1 and
+C8 are narrowed to drop assertions about capabilities that no longer exist.
+This is edited in place rather than left stale, because a check asserting
+removed behaviour would fail forever and defeat the point of keeping it.
+
 ## Acceptance criteria
 
 - C1 delta/bin/install writes only under $HOME; the repository it is run from is never touched
@@ -80,7 +91,6 @@ No package manager, no installer beyond a shell script, no network fetch -
 - C4 DELTA_ROOT overrides discovery
 - C5 project-level and user-level command output always land at different absolute paths
 - C6 a repo with delta/bin/verify committed runs correctly with no ~/.delta present
-- C7 verify notes a version mismatch against a newer global runner, and never modifies the repo's own runner
 - C8 MANUAL explore, propose, apply, and archive each correctly instruct root discovery, and propose's lazy-init instructs creating delta/ from the template with no invented content and no runner fabricated by hand
       reason: these are agent-executed prompts; correctness is a property of
       the instruction text, which only a read can judge, not a check that runs
@@ -91,5 +101,7 @@ No package manager, no installer beyond a shell script, no network fetch -
       confirm: each names DELTA_ROOT as the override, walks up for delta/
       (then .git where relevant), announces a resolved root that differs from
       cwd, and propose's lazy-init copies the constitution template verbatim
-      with an explicit instruction never to fill it in or introspect the repo,
-      and bootstraps the runner by file copy only, refusing to fabricate one
+      with an explicit instruction never to fill it in or introspect the repo;
+      and that step 3 checks whether delta/bin/verify already exists, never
+      creates it, and if missing tells the user plainly to copy it in from
+      another repo rather than fabricating its contents

@@ -116,28 +116,27 @@ Replace everything below with your own rules.
 - ...
    ```
 
-3. Bootstrap the runner — a committed program has to be the real thing, not
-   prose an agent transcribes from memory, so this is a file copy, not
-   something written from scratch:
+3. Check whether `delta/bin/verify` already exists. This step never creates
+   it — a committed program has to be the real thing, not prose an agent
+   transcribes from memory, and there is no global copy to pull it from
+   either: `delta/bin/verify` is committed in every repo that has it, and
+   that repo's own copy is the only one that ever exists. If it is missing,
+   say so plainly and tell the user to copy it in from another repository
+   that already has delta set up — one file, one command, for example:
 
    ```sh
-   sh -c '
-     if [ -f "$HOME/.delta/bin/verify" ]; then
-       cp "$HOME/.delta/bin/verify" delta/bin/verify
-       chmod +x delta/bin/verify
-       echo "bootstrapped delta/bin/verify from ~/.delta/bin/verify"
-     else
-       echo "this machine has no ~/.delta/bin/verify - run delta/bin/install once from a checkout that has delta, then re-run propose" >&2
-       exit 1
-     fi
-   '
+   cp path/to/other/repo/delta/bin/verify delta/bin/verify
+   chmod +x delta/bin/verify
    ```
 
-   If that fails, stop here and report exactly what it printed. Do not
-   fabricate a runner by hand to route around it.
+   Do not fabricate the file's contents to route around this. Continue with
+   the rest of this step regardless — `truth/`, `changes/`, and the
+   constitution do not depend on the runner being present yet — but `verify`
+   will not work until it is.
 
 4. Say, in one line, that `delta/` was created and needs to be committed —
-   the checks and truth you are about to write only survive a clone if it is.
+   the checks and truth you are about to write only survive a clone if it is,
+   and so does `delta/bin/verify` once it is copied in.
 
 Then continue below as normal. This repository now has a `delta/` exactly
 like one that has been running delta for years, except `truth/` and
@@ -238,8 +237,10 @@ Rules that make the binding work:
 - Name it `C<n>-<short-slug>.sh`. The runner binds a check to a criterion by
   that `C<n>` filename prefix, so `C3-` serves `C3`.
 - First line a shebang; second line `# CRITERION: C<n> <the criterion text>`.
-- Make it executable. A check without the executable bit is reported as a
-  failure, which is correct but wastes a run.
+- Run `chmod +x` on it as part of writing it, every time — `test`, `curl`, and
+  every other write-a-file tool leaves the executable bit off by default. A
+  check without it is reported as an error, not silently skipped, but that
+  still wastes a run for something you could have gotten right the first time.
 - It runs with the working directory at the repository root. `$DELTA_CHANGE_DIR`,
   `$DELTA_CHECK_DIR`, and `$DELTA_RUN_DIR` are exported if it needs its own
   fixtures.

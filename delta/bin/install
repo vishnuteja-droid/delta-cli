@@ -4,14 +4,13 @@
 #
 # Usage:  delta/bin/install
 #
-# What it does, and nothing else:
-#   1. Writes the five command files into every adapter's user_dir (from
-#      delta/adapters.yaml), e.g. ~/.claude/commands/, ~/.gemini/commands/.
-#   2. Copies delta/bin/verify to ~/.delta/bin/verify - the canonical runner
-#      a repo's own delta/bin/verify is bootstrapped from on first use.
-#   3. Copies delta/constitution.md to ~/.delta/constitution-template.md - a
-#      convenience copy of the same hand-written template; propose embeds it
-#      directly too, so this machine having it is not load-bearing.
+# What it does, and nothing else: writes the five command files into every
+# adapter's user_dir (from delta/adapters.yaml), e.g. ~/.claude/commands/,
+# ~/.gemini/commands/. Nothing else is installed, and nothing is written
+# anywhere else - there is no global copy of the runner. delta/bin/verify is
+# committed in each repository; that is the only copy, always. A repo that
+# wants delta gets delta/bin/verify by copying it in from another repo that
+# already has it - one file, one command, no install step for it at all.
 #
 # It copies files that already exist in this checkout. No network fetch, no
 # package manager, nothing installed beyond those copies.
@@ -20,8 +19,8 @@
 # a project's own committed command files still win over these (that
 # precedence is the CLIs' own behaviour, not something this script controls).
 #
-# To uninstall: rm -rf ~/.delta and the user_dir paths this script printed.
-# No repository is touched by either installing or uninstalling.
+# To uninstall: rm -rf the user_dir paths this script printed below. No
+# repository is touched by either installing or uninstalling.
 
 set -u
 
@@ -33,24 +32,15 @@ die() { printf 'install: %s\n' "$1" >&2; exit 1; }
 
 [ -n "${HOME-}" ] || die "\$HOME is not set"
 [ -x "$DELTA_DIR/bin/generate-commands" ] || die "no generate-commands at $DELTA_DIR/bin/generate-commands"
-[ -f "$DELTA_DIR/bin/verify" ] || die "no runner at $DELTA_DIR/bin/verify"
-[ -f "$DELTA_DIR/constitution.md" ] || die "no constitution template at $DELTA_DIR/constitution.md"
 
 printf '\n  installing delta commands\n\n'
 
 "$DELTA_DIR/bin/generate-commands" --target user || die "generate-commands --target user failed"
 
-mkdir -p "$HOME/.delta/bin" || die "cannot create $HOME/.delta/bin"
-cp "$DELTA_DIR/bin/verify" "$HOME/.delta/bin/verify" || die "cannot copy the runner"
-chmod +x "$HOME/.delta/bin/verify"
-cp "$DELTA_DIR/constitution.md" "$HOME/.delta/constitution-template.md" || die "cannot copy the constitution template"
-
-ver=$(grep -m1 '^RUNNER_VERSION=' "$HOME/.delta/bin/verify" | sed 's/^RUNNER_VERSION=//')
-
-printf '\n  runner       ~/.delta/bin/verify (version %s)\n' "${ver:-unknown}"
-printf '  template     ~/.delta/constitution-template.md\n'
 printf '\n  every repo on this machine now has /delta-explore and friends.\n'
 printf '  the first delta/propose in a repo creates that repo'"'"'s own delta/ -\n'
-printf '  nothing else to run.\n\n'
-printf '  to uninstall: rm -rf ~/.delta, and the user-level command\n'
-printf '  directories listed above. no repository is touched.\n\n'
+printf '  nothing else to run, except delta/bin/verify itself: copy that one\n'
+printf '  file in from a repo that already has it, and commit it. it is the\n'
+printf '  only copy, ever - nothing here tracks a version of it.\n\n'
+printf '  to uninstall: rm -rf the user-level command directories listed\n'
+printf '  above. no repository is touched.\n\n'
