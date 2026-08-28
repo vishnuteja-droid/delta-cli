@@ -19,6 +19,128 @@ The very last line is the closing frame, described at the bottom of this file.
 A closing frame is how the reader knows you ran this command to completion
 instead of drifting off part-way, so it is not optional and not decorative.
 
+## Where this repository's delta/ lives, or will
+
+Resolve the root the way git resolves its own, before doing anything else:
+
+1. If `$DELTA_ROOT` is set, use it without searching.
+2. Otherwise check the current directory, then each parent in turn, for a
+   `delta/` directory. If found, that is the root, and it already has a
+   `delta/` — skip straight to "Read first" below.
+3. If none is found, do the same walk again looking for `.git` instead. That
+   is the root. This repository has never run `propose`, so `delta/` does not
+   exist yet — go to "Creating delta/ for the first time" below before
+   anything else.
+4. If neither is found, this is not inside a repository. Say so and stop.
+
+If the resolved root is not the current directory, say so before doing
+anything else: `root: /path/to/repo`. Every `delta/...` path below is
+relative to that root, not to the current directory.
+
+## Creating delta/ for the first time
+
+Skip this section entirely if `delta/` already exists at the resolved root.
+
+Adding delta to a repository is nothing more than this happening once, the
+first time someone runs `propose` in it. There is no separate init command,
+and there will not be one — see the constitution template's own note on why,
+right below.
+
+1. `mkdir -p delta/truth delta/changes delta/bin`
+
+2. Write `delta/constitution.md` with **exactly** the template below —
+   verbatim, character for character. Do not fill in the blanks, do not
+   invent example rules, and do not introspect the repository to write real
+   ones — that is the one thing this lifecycle refuses to automate, on
+   purpose, because auto-generated context files measurably reduce agent
+   success. The next person edits this file by hand; your job is only to put
+   the template where they will find it.
+
+   ```markdown
+# Constitution
+
+Rules every change inherits. `propose` and `apply` both read this file first.
+
+**Write this by hand.** Delta ships no command that generates it by reading
+your repository, and that omission is deliberate: auto-generated context files
+measurably reduce agent success and raise cost, while hand-written ones improve
+both. Ten lines you wrote beat sixty a tool inferred.
+
+**Litmus test for every line below: would removing this line cause an agent to
+make a mistake it would not otherwise make?** If not, delete the line. This
+file is not a style guide, not an onboarding document, and not a place for
+things a competent contributor already does. Keep it under 60 lines. When it
+grows past that, something in it has stopped being non-negotiable.
+
+Replace everything below with your own rules.
+
+## Layering
+
+<!-- Which direction may dependencies point, and what may never import what.
+     Example:
+     - The domain layer imports nothing from web, persistence, or messaging.
+     - Controllers call services. Controllers never touch repositories.       -->
+
+- ...
+
+## Never touch
+
+<!-- Code, data, or config that must not change as a side effect of any
+     change, and what to do instead when a change appears to require it.
+     Example:
+     - Never edit a file under db/migrations/ that has shipped. Add a new one.
+     - Never change the wire format of events on the settlement topic.        -->
+
+- ...
+
+## Errors
+
+<!-- What is thrown or returned, what is caught and where, what surfaces to a
+     caller, and what must never be swallowed.
+     Example:
+     - No empty catch blocks. Rethrow as a domain error or handle it.
+     - Errors crossing the API boundary carry a code, never a stack trace.    -->
+
+- ...
+
+## Logging
+
+<!-- Levels, required context, and what may never be logged.
+     Example:
+     - Never log card numbers, tokens, or full request bodies.
+     - Every log line at the service boundary carries the correlation id.     -->
+
+- ...
+   ```
+
+3. Bootstrap the runner — a committed program has to be the real thing, not
+   prose an agent transcribes from memory, so this is a file copy, not
+   something written from scratch:
+
+   ```sh
+   sh -c '
+     if [ -f "$HOME/.delta/bin/verify" ]; then
+       cp "$HOME/.delta/bin/verify" delta/bin/verify
+       chmod +x delta/bin/verify
+       echo "bootstrapped delta/bin/verify from ~/.delta/bin/verify"
+     else
+       echo "this machine has no ~/.delta/bin/verify - run delta/bin/install once from a checkout that has delta, then re-run propose" >&2
+       exit 1
+     fi
+   '
+   ```
+
+   If that fails, stop here and report exactly what it printed. Do not
+   fabricate a runner by hand to route around it.
+
+4. Say, in one line, that `delta/` was created and needs to be committed —
+   the checks and truth you are about to write only survive a clone if it is.
+
+Then continue below as normal. This repository now has a `delta/` exactly
+like one that has been running delta for years, except `truth/` and
+`changes/` start empty — which "Greenfield is not a special mode" below
+already covers, since an empty `truth/` is not a special case either.
+
 ## What you are doing
 
 Intent: {{args}}
@@ -33,7 +155,9 @@ Use the existing change directory if `explore` already made one for this area.
 
 1. `delta/constitution.md` — inherited by every change. Its rules constrain
    what you are allowed to propose. A spec that violates it is invalid, not a
-   judgement call.
+   judgement call. Immediately after creating it from the template, it has
+   nothing but prompts in it, which constrains nothing yet — that is expected
+   and not something to work around.
 2. `delta/truth/` — the current understanding of the system.
 3. `delta/changes/<id>/explore.md` — findings, if explore has run.
 

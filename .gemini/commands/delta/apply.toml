@@ -19,6 +19,20 @@ The very last line is the closing frame, described at the bottom of this file.
 A closing frame is how the reader knows you ran this command to completion
 instead of drifting off part-way, so it is not optional and not decorative.
 
+## Where this repository's delta/ lives
+
+Resolve the root the way git resolves its own, before doing anything else:
+
+1. If `$DELTA_ROOT` is set, use it without searching.
+2. Otherwise check the current directory, then each parent in turn, for a
+   `delta/` directory. The first one found is the root.
+3. If none is found anywhere above you, stop: there is no `delta/` here yet,
+   so there is nothing to apply. Say so and point at `/delta:propose`.
+
+If the resolved root is not the current directory, say so before doing
+anything else: `root: /path/to/repo`. Every `delta/...` path below is
+relative to that root, not to the current directory.
+
 ## What you are doing
 
 Change: {{args}} — if empty, use the most recently modified directory under

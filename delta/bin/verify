@@ -3,9 +3,21 @@
 #
 # Usage:  delta/bin/verify [--archive-gate] [change-id]
 #         DELTA_CHANGE=<id> delta/bin/verify
+#         DELTA_ROOT=<path> delta/bin/verify
 #
 # With no argument the most recently modified directory under delta/changes/
 # is used.
+#
+# Root: by default this script resolves the repository root from its own
+# location (it lives at <root>/delta/bin/verify, wherever that is), which
+# already works correctly from any cwd. Set DELTA_ROOT to override that and
+# point at a different repository's delta/ explicitly. When the resolved
+# root is not the current directory, the run announces it.
+#
+# Version: if this repo's delta/bin/verify is older than the machine-wide
+# copy at ~/.delta/bin/verify (installed by delta/bin/install), the run notes
+# the mismatch. It never updates itself - the thing that decides pass or
+# fail does not change silently.
 #
 # Exit codes:
 #   0  every criterion has a check, every check passed, every MANUAL signed off
@@ -43,19 +55,36 @@
 
 set -u
 
-RUNNER_VERSION=1
+RUNNER_VERSION=2
 TAB=$(printf "\t")
 
 # ---------------------------------------------------------------- locate ----
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 4
-DELTA_DIR=$(dirname -- "$script_dir")
-ROOT=$(dirname -- "$DELTA_DIR")
-CHANGES_DIR="$DELTA_DIR/changes"
 
 die() {
     printf '  delta verify: %s\n' "$1" >&2
     exit 4
+}
+
+if [ -n "${DELTA_ROOT-}" ]; then
+    [ -d "$DELTA_ROOT" ] || die "DELTA_ROOT does not exist: $DELTA_ROOT"
+    ROOT=$(CDPATH= cd -- "$DELTA_ROOT" && pwd) || die "cannot resolve DELTA_ROOT: $DELTA_ROOT"
+    [ -d "$ROOT/delta" ] || die "DELTA_ROOT has no delta/ directory: $ROOT"
+    DELTA_DIR="$ROOT/delta"
+else
+    DELTA_DIR=$(dirname -- "$script_dir")
+    ROOT=$(dirname -- "$DELTA_DIR")
+fi
+CHANGES_DIR="$DELTA_DIR/changes"
+
+cwd=$(pwd) || cwd=''
+root_announced=0
+announce_root_if_needed() {
+    [ "$root_announced" -eq 1 ] && return 0
+    root_announced=1
+    [ -n "$cwd" ] && [ "$cwd" = "$ROOT" ] && return 0
+    printf '  %s\n' "$(trunc "root: $ROOT" "$((cols - 2))")"
 }
 
 archive_gate=0
@@ -336,6 +365,28 @@ FAILLOG="$RUN_DIR/.failures"
 WARNLOG="$RUN_DIR/.warnings"
 : > "$FAILLOG"
 : > "$WARNLOG"
+
+announce_root_if_needed
+
+preamblew=$((cols - 2))
+[ "$preamblew" -lt 20 ] && preamblew=20
+
+# A newer machine-wide runner is informational only: this script never
+# rewrites or re-execs itself. Silent when $HOME or the global copy is absent.
+if [ -n "${HOME-}" ] && [ -f "$HOME/.delta/bin/verify" ]; then
+    global_ver=$(grep -m1 '^RUNNER_VERSION=' "$HOME/.delta/bin/verify" 2>/dev/null | sed 's/^RUNNER_VERSION=//')
+    case "$global_ver" in
+        ''|*[!0-9]*) : ;;
+        *)
+            if [ "$global_ver" -gt "$RUNNER_VERSION" ] 2>/dev/null; then
+                printf '  %s%s%s\n' "$C_DIM" \
+                    "$(trunc "note: this repo's runner is v$RUNNER_VERSION; ~/.delta/bin/verify is v$global_ver" "$preamblew")" "$C_OFF"
+                printf '  %s%s%s\n' "$C_DIM" \
+                    "$(trunc "      run delta/bin/install, then copy it in yourself if you want the update" "$preamblew")" "$C_OFF"
+            fi
+            ;;
+    esac
+fi
 
 rule_line "delta verify $SEP $label"
 printf '\n'

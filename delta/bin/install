@@ -1,0 +1,56 @@
+#!/bin/sh
+# delta install - make the five delta commands available on this machine, in
+# every repository, with no per-repo setup.
+#
+# Usage:  delta/bin/install
+#
+# What it does, and nothing else:
+#   1. Writes the five command files into every adapter's user_dir (from
+#      delta/adapters.yaml), e.g. ~/.claude/commands/, ~/.gemini/commands/.
+#   2. Copies delta/bin/verify to ~/.delta/bin/verify - the canonical runner
+#      a repo's own delta/bin/verify is bootstrapped from on first use.
+#   3. Copies delta/constitution.md to ~/.delta/constitution-template.md - a
+#      convenience copy of the same hand-written template; propose embeds it
+#      directly too, so this machine having it is not load-bearing.
+#
+# It copies files that already exist in this checkout. No network fetch, no
+# package manager, nothing installed beyond those copies.
+#
+# Safe to re-run: it always overwrites with the current canonical source, and
+# a project's own committed command files still win over these (that
+# precedence is the CLIs' own behaviour, not something this script controls).
+#
+# To uninstall: rm -rf ~/.delta and the user_dir paths this script printed.
+# No repository is touched by either installing or uninstalling.
+
+set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+DELTA_DIR=$(dirname -- "$script_dir")
+ROOT=$(dirname -- "$DELTA_DIR")
+
+die() { printf 'install: %s\n' "$1" >&2; exit 1; }
+
+[ -n "${HOME-}" ] || die "\$HOME is not set"
+[ -x "$DELTA_DIR/bin/generate-commands" ] || die "no generate-commands at $DELTA_DIR/bin/generate-commands"
+[ -f "$DELTA_DIR/bin/verify" ] || die "no runner at $DELTA_DIR/bin/verify"
+[ -f "$DELTA_DIR/constitution.md" ] || die "no constitution template at $DELTA_DIR/constitution.md"
+
+printf '\n  installing delta commands\n\n'
+
+"$DELTA_DIR/bin/generate-commands" --target user || die "generate-commands --target user failed"
+
+mkdir -p "$HOME/.delta/bin" || die "cannot create $HOME/.delta/bin"
+cp "$DELTA_DIR/bin/verify" "$HOME/.delta/bin/verify" || die "cannot copy the runner"
+chmod +x "$HOME/.delta/bin/verify"
+cp "$DELTA_DIR/constitution.md" "$HOME/.delta/constitution-template.md" || die "cannot copy the constitution template"
+
+ver=$(grep -m1 '^RUNNER_VERSION=' "$HOME/.delta/bin/verify" | sed 's/^RUNNER_VERSION=//')
+
+printf '\n  runner       ~/.delta/bin/verify (version %s)\n' "${ver:-unknown}"
+printf '  template     ~/.delta/constitution-template.md\n'
+printf '\n  every repo on this machine now has /delta-explore and friends.\n'
+printf '  the first delta/propose in a repo creates that repo'"'"'s own delta/ -\n'
+printf '  nothing else to run.\n\n'
+printf '  to uninstall: rm -rf ~/.delta, and the user-level command\n'
+printf '  directories listed above. no repository is touched.\n\n'

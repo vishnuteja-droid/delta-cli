@@ -2,12 +2,20 @@
 # delta generate-commands - emit per-CLI command files from delta/commands/
 # using the format table in delta/adapters.yaml.
 #
-# Usage:  delta/bin/generate-commands [--check] [adapter-id ...]
+# Usage:  delta/bin/generate-commands [--target project|user] [--check] [adapter-id ...]
 #
-#   --check   generate into a temporary tree and diff against what is
-#             committed; exit 1 if they differ. For CI.
+#   --target project   write into each adapter's project-level `dir` (default).
+#                       Relative to the repository root; the output is
+#                       committed. This is what a team commits to pin or
+#                       customise a variant - it still wins over the
+#                       user-level copy in every listed tool.
+#   --target user       write into each adapter's machine-level `user_dir`,
+#                       under $HOME. Nothing is written to the repository.
+#                       This is what `delta/bin/install` calls.
+#   --check             project mode only: generate into a temporary tree and
+#                       diff against what is committed; exit 1 if they differ.
 #
-# The generated files are committed. Regenerate after editing anything in
+# Project-mode output is committed. Regenerate after editing anything in
 # delta/commands/, and commit the result.
 #
 # Adding a CLI is an entry in delta/adapters.yaml. It is never a change to
@@ -27,7 +35,19 @@ die() { printf 'generate-commands: %s\n' "$1" >&2; exit 1; }
 [ -d "$SRC" ]   || die "no commands directory at $SRC"
 
 check_mode=0
-if [ "${1-}" = --check ]; then check_mode=1; shift; fi
+target=project
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check_mode=1; shift ;;
+        --target) target=${2:-}; shift 2 ;;
+        --target=*) target=${1#--target=}; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) break ;;
+    esac
+done
+case "$target" in project|user) ;; *) die "--target must be 'project' or 'user', got '$target'" ;; esac
+[ "$check_mode" -eq 1 ] && [ "$target" = user ] && die "--check only applies to --target project"
 want=$*
 
 # --------------------------------------------------------------- the table ---
@@ -38,9 +58,9 @@ read_table() {
     awk '
         function flush() {
             if (f["id"] == "") return
-            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                 f["id"], f["name"], f["dir"], f["ext"], f["naming"],
-                f["format"], f["args"], f["name_field"], f["invoke"]
+                f["format"], f["args"], f["name_field"], f["invoke"], f["user_dir"]
             for (k in f) delete f[k]
         }
         /^adapters:/ { inlist = 1; next }
@@ -91,6 +111,20 @@ fm_value()     { front_matter "$1" | awk -v k="$2" '
 
 subst_args()   { awk -v tok="$1" '{ gsub(/\$ARGUMENTS/, tok); print }'; }
 
+# Splices delta/constitution.md verbatim in place of a line that reads exactly
+# {{CONSTITUTION_TEMPLATE}}. One canonical copy of the template; the copy that
+# ships inside propose can never drift from it because it is not a copy.
+inject_constitution() {  # $1 = path to delta/constitution.md
+    awk -v tmpl="$1" '
+        /^[ \t]*\{\{CONSTITUTION_TEMPLATE\}\}[ \t]*$/ {
+            while ((getline line < tmpl) > 0) print line
+            close(tmpl)
+            next
+        }
+        { print }
+    '
+}
+
 # ---------------------------------------------------------------- generate ---
 
 generate_into() {
@@ -98,7 +132,7 @@ generate_into() {
     written=0
     adapters=0
 
-    read_table | while IFS='	' read -r id name dir ext naming format args name_field invoke; do
+    read_table | while IFS='	' read -r id name dir ext naming format args name_field invoke user_dir; do
         [ -n "$id" ] || continue
         if [ -n "$want" ]; then
             found=0
@@ -107,9 +141,15 @@ generate_into() {
         fi
         adapters=$((adapters + 1))
 
+        if [ "$target" = user ]; then
+            [ -n "$user_dir" ] || die "adapter $id: no user_dir set in adapters.yaml"
+            base="$HOME/$user_dir"
+        else
+            base="$out_root/$dir"
+        fi
         case "$naming" in
-            subdir) target_dir="$out_root/$dir/delta" ;;
-            prefix) target_dir="$out_root/$dir" ;;
+            subdir) target_dir="$base/delta" ;;
+            prefix) target_dir="$base" ;;
             *) die "adapter $id: unknown naming '$naming'" ;;
         esac
         mkdir -p "$target_dir" || die "cannot create $target_dir"
@@ -132,15 +172,16 @@ generate_into() {
                     # Literal multi-line strings: no escape processing, so the
                     # body passes through untouched. Guard the one sequence
                     # that would terminate it early.
-                    if body "$src" | grep -q "'''"; then
-                        die "$src contains ''' which cannot be embedded in TOML"
+                    rendered=$(body "$src" | inject_constitution "$DELTA_DIR/constitution.md" | subst_args "$args")
+                    if printf '%s\n' "$rendered" | grep -q "'''"; then
+                        die "$src (after injecting the constitution template) contains ''' which cannot be embedded in TOML"
                     fi
                     {
                         printf '# Generated by delta/bin/generate-commands from delta/commands/%s.md\n' "$cmd"
                         printf '# Edit that file and regenerate; do not edit this one.\n\n'
                         printf 'description = "%s"\n' "$(printf '%s' "$desc" | sed 's/\\/\\\\/g; s/"/\\"/g')"
                         printf 'prompt = %s\n' "'''"
-                        body "$src" | subst_args "$args"
+                        printf '%s\n' "$rendered"
                         printf '%s\n' "'''"
                     } > "$out"
                     ;;
@@ -154,16 +195,22 @@ generate_into() {
                         printf -- '---\n\n'
                         printf '<!-- Generated by delta/bin/generate-commands from delta/commands/%s.md.\n' "$cmd"
                         printf '     Edit that file and regenerate; do not edit this one. -->\n'
-                        body "$src" | subst_args "$args"
+                        body "$src" | inject_constitution "$DELTA_DIR/constitution.md" | subst_args "$args"
                     } > "$out"
                     ;;
                 plain)
-                    body "$src" | subst_args "$args" > "$out"
+                    body "$src" | inject_constitution "$DELTA_DIR/constitution.md" | subst_args "$args" > "$out"
                     ;;
                 *) die "adapter $id: unknown format '$format'" ;;
             esac
             written=$((written + 1))
-            [ "$check_mode" -eq 1 ] || printf '  %-14s %s\n' "$id" "${out#$out_root/}"
+            if [ "$check_mode" -ne 1 ]; then
+                if [ "$target" = user ]; then
+                    printf '  %-14s %s\n' "$id" "${out#$HOME/}"
+                else
+                    printf '  %-14s %s\n' "$id" "${out#$out_root/}"
+                fi
+            fi
         done
     done
 }
@@ -173,7 +220,7 @@ if [ "$check_mode" -eq 1 ]; then
     trap 'rm -rf "$tmp"' EXIT
     generate_into "$tmp"
     rc=0
-    read_table | while IFS='	' read -r id name dir ext naming format args name_field invoke; do
+    read_table | while IFS='	' read -r id name dir ext naming format args name_field invoke user_dir; do
         [ -d "$tmp/$dir" ] || continue
         diff -ru "$ROOT/$dir" "$tmp/$dir" >/dev/null 2>&1 || {
             printf 'out of date: %s\n' "$dir" >&2
@@ -187,6 +234,10 @@ if [ "$check_mode" -eq 1 ]; then
         printf '\nrun: delta/bin/generate-commands\n' >&2
     fi
     exit "$rc"
+fi
+
+if [ "$target" = user ]; then
+    [ -n "${HOME-}" ] || die "\$HOME is not set; cannot resolve a user-level target directory"
 fi
 
 printf '\n'

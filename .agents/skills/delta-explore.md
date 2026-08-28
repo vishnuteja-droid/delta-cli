@@ -22,13 +22,38 @@ The very last line is the closing frame, described at the bottom of this file.
 A closing frame is how the reader knows you ran this command to completion
 instead of drifting off part-way, so it is not optional and not decorative.
 
+## Where this repository's delta/ lives, if it has one
+
+Resolve the root the way git resolves its own, before doing anything else:
+
+1. If `$DELTA_ROOT` is set, use it without searching.
+2. Otherwise check the current directory, then each parent in turn, for a
+   `delta/` directory. The first one found is the root, and it already has a
+   `delta/` you can write into.
+3. If none is found, do the same walk again looking for `.git` instead. That
+   is the root of the repository — but it has no `delta/` yet, meaning this
+   repository has never run `propose`. **Do not create `delta/` here.**
+   Explore never creates it; only `propose` does, and only when it needs to.
+   Continue anyway, writing findings to the terminal only (see below).
+4. If neither is found, this is not inside a repository. Say so and stop.
+
+If the resolved root is not the current directory, say so before doing
+anything else: `root: /path/to/repo`. Every `delta/...` path below is
+relative to that root, not to the current directory.
+
 ## What you are doing
 
 Area: $ARGUMENTS
 
-You are building understanding *before* anyone proposes a change to it. The
-output is a findings file at `delta/changes/<id>/explore.md`, where `<id>` is a
-short kebab-case slug for the area. Create the directory if it does not exist.
+You are building understanding *before* anyone proposes a change to it.
+
+If `delta/` exists at the resolved root, write the output as a findings file
+at `delta/changes/<id>/explore.md`, where `<id>` is a short kebab-case slug
+for the area — creating `delta/changes/<id>/` if it does not exist yet, but
+never creating `delta/` itself. If `delta/` does not exist at all, explore has
+nothing to write into: print the same findings to the terminal in full and
+stop there. Do not create `delta/` to make a place to put them — that is
+`propose`'s decision to make, not this command's.
 
 This is the step that makes the following `propose` worth trusting. A findings
 file that restates what the code obviously says has failed, even if everything
@@ -36,9 +61,11 @@ in it is true.
 
 ## Read first
 
-Read `delta/constitution.md` if it exists. Read `delta/truth/` if it is not
-empty — that is what is already understood, and you are looking for what it
-does not yet cover.
+Read `delta/constitution.md` if it exists at the resolved root. Read
+`delta/truth/` if it exists and is not empty — that is what is already
+understood, and you are looking for what it does not yet cover. Neither
+existing is a normal, common state for a repository that has never run
+`propose`; proceed without them.
 
 ## Find these four things
 
@@ -84,7 +111,8 @@ command's job and doing it here contaminates it.
 
 ## Print to the terminal
 
-Between the frames, print the condensed form — not the whole file:
+If a findings file was written, print the condensed form between the frames —
+not the whole file:
 
      entry    PaymentController.dispatch
      chain    eapi → papi → sapi → ledger
@@ -93,6 +121,10 @@ Between the frames, print the condensed form — not the whole file:
 Three-space indent, label column padded to 8, then the value. One line per
 item. If there are more than about eight lines, print the entry points and the
 unknowns and say how many other findings are in the file.
+
+If no `delta/` exists and nothing was written, print the full findings in that
+same format instead of a condensed version of them — the terminal is the only
+copy, so print all of it, not a summary of it.
 
 ## Signature frame — print this last
 

@@ -11,12 +11,41 @@ exist. The loop is what doesn't: explore feeds propose, propose compiles
 checks, verify runs them, archive folds the result back into truth, and the
 next change diffs against reality instead of history.
 
-## Nothing is installed
+## Nothing is installed except the commands, once
 
-No binary, no compile step, no Python, no Node, no package manager. delta is
-files that ship with the repository plus one committed POSIX `sh` script.
+No binary, no compile step, no Python, no Node, no package manager. The five
+commands install once per machine — not once per repo — with a single script;
+every repo's own data (`truth/`, `changes/`, the constitution) is created
+lazily, by the tool itself, the first time you actually use it there.
 
 **Windows needs WSL or Git Bash.** The runner is `sh`, not PowerShell.
+
+## Installing delta on this machine
+
+Clone this repository once, then:
+
+```sh
+delta/bin/install
+```
+
+That writes the five commands into every supported CLI's personal command
+directory (`~/.claude/commands/`, `~/.gemini/commands/`, …, from the table in
+`adapters.yaml`) and copies the runner to `~/.delta/bin/verify`. It copies
+files that already exist in this checkout — no network fetch, nothing else
+installed. Safe to re-run any time.
+
+From then on, `/delta-explore` (or `/delta:explore` in Gemini CLI) works in
+**any** repository on this machine, including one that has never seen delta.
+Adding delta to a repository is nothing more than running `propose` in it once
+— see [Lazy per-repo data](#lazy-per-repo-data) below.
+
+A repo can still commit its own project-level command files (in `.claude/commands/`,
+etc.) to pin or customise a variant for its team — that copy wins over the
+one `install` wrote, in every listed CLI. `install` is what makes the commands
+available before a repo has opted into anything; it is never the only path.
+
+To uninstall: `rm -rf ~/.delta` and the personal command directories it wrote
+to. No repository is touched by installing or uninstalling either one.
 
 ## The five commands
 
@@ -65,7 +94,13 @@ Expect most checks to be thin wrappers over existing tests. That's correct.
 ```sh
 delta/bin/verify [change-id]          # defaults to the most recent change
 delta/bin/verify path/to/change/dir   # anything with a slash is a path
+DELTA_ROOT=/path/to/repo delta/bin/verify [change-id]   # override root discovery
 ```
+
+Root discovery: the script normally resolves its root from its own location —
+it lives at `<root>/delta/bin/verify`, so that already works from any cwd.
+`DELTA_ROOT` overrides it explicitly. When the resolved root isn't the current
+directory, the run announces it (`root: /path/to/repo`) before anything else.
 
 Exit codes:
 
@@ -176,13 +211,13 @@ would duplicate everything and drift.
 
 ## Layout
 
+Per repository — created lazily by `propose`, the first time it runs there,
+and committed from then on:
+
 ```
 delta/
   constitution.md          hand-written, inherited by every change
-  bin/verify               committed POSIX sh runner
-  bin/generate-commands    emits per-CLI files from the table
-  adapters.yaml            CLI format table
-  commands/                canonical command source, one file each
+  bin/verify               bootstrapped from ~/.delta/bin/verify, then committed
   truth/                   current understanding; only archive writes here
   changes/<id>/
     explore.md             findings, including known unknowns
@@ -190,6 +225,56 @@ delta/
     checks/                executable files, one per criterion
     run/                   results per verification run
 ```
+
+Per machine — written once by `delta/bin/install`, in this checkout and in
+`~/.delta/`, never inside any other repository:
+
+```
+~/.delta/
+  bin/verify                 canonical runner; repos bootstrap their own copy from this
+  constitution-template.md   convenience copy of delta/constitution.md
+
+~/.claude/commands/delta-*.md      (and the equivalent for every adapters.yaml entry)
+
+delta/                        this checkout only - the canonical source install reads from
+  adapters.yaml                CLI format table
+  bin/install                  writes the above
+  bin/generate-commands        emits per-CLI files from the table (--target project|user)
+  commands/                    canonical command source, one file each
+```
+
+## Lazy per-repo data
+
+There is no `init` command. The first time `propose` runs in a repository —
+found by walking up from the current directory for a `delta/` and, failing
+that, for a `.git`, the same way git resolves its own root — it creates
+`delta/{truth,changes,bin}`, writes `delta/constitution.md` from the template
+verbatim, and bootstraps `delta/bin/verify` from `~/.delta/bin/verify`. It
+then says, in one line, that `delta/` was created and needs to be committed.
+
+`explore` is the one command that works before any of that exists: point it
+at a repository that has never run `propose` and it still reads the code and
+prints findings — to the terminal, since there is nowhere to write them yet.
+It never creates `delta/` itself; only `propose` does, and only when it needs
+to.
+
+Every command resolves its root the same way, honouring `DELTA_ROOT` as an
+explicit override, and says so when the resolved root isn't the current
+directory:
+
+```
+root: /path/to/repo
+```
+
+That means every command works from any subdirectory of a repo, not just its
+root — the same way `git status` works from three directories deep.
+
+A teammate who clones a repo that already has `delta/` needs none of this:
+`delta/bin/verify` is a committed file, so `verify` runs correctly with no
+install on that machine at all. If the repo's own runner is older than the
+machine's `~/.delta/bin/verify`, `verify` notes the mismatch — it never
+updates itself, because the thing that decides pass or fail must never change
+silently.
 
 ## The constitution
 
@@ -202,21 +287,29 @@ mistake it would not otherwise make?* If not, delete it.
 
 There is deliberately **no `init` that generates it by introspecting the
 repo.** Auto-generated context files reduce agent success and raise cost;
-hand-written ones improve both. `delta/constitution.md` ships as a template
-with prompts, not as a generator.
+hand-written ones improve both. `propose` writes the exact same template —
+prompts, not a generator — the first time it runs in a repository; nothing
+about that changes what goes in it. Replace it with your own rules before the
+first real change lands.
 
 ## Working with any CLI
 
 Adapters are data, not code. `delta/commands/` holds one canonical file per
-command; `delta/adapters.yaml` describes each target's directory, extension,
-and wrapper format; `delta/bin/generate-commands` emits the per-tool files,
-which are committed.
+command; `delta/adapters.yaml` describes each target's project-level `dir`
+*and* machine-level `user_dir`, extension, and wrapper format;
+`delta/bin/generate-commands` emits the per-tool files.
 
 ```sh
-delta/bin/generate-commands           # regenerate all
-delta/bin/generate-commands claude    # just one
-delta/bin/generate-commands --check   # CI: fail if committed output is stale
+delta/bin/generate-commands                    # project-level, all adapters - the default, committed
+delta/bin/generate-commands claude              # project-level, just one
+delta/bin/generate-commands --check             # CI: fail if committed project-level output is stale
+delta/bin/generate-commands --target user       # machine-level, under $HOME - what install calls
 ```
+
+Project-level output is what a team commits to pin or customise a variant; it
+still wins over the machine-level copy in every listed CLI. Machine-level
+output, written by `delta/bin/install`, is what makes the commands available
+before a repo has opted into anything at all.
 
 **Adding a CLI is an entry in `adapters.yaml`. It is never a code change.**
 That's the property being built for: this landscape churns, and an adapter

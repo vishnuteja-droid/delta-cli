@@ -12,7 +12,14 @@
 # Fields
 #   id          slug used in generator output
 #   name        human name
-#   dir         directory the tool loads commands from, relative to repo root
+#   dir         project-level directory the tool loads commands from,
+#               relative to repo root. Committing files here still wins over
+#               the user-level copy in every listed tool - a team that wants
+#               a pinned or customised variant gets it by committing this.
+#   user_dir    machine-level directory, relative to $HOME. `delta/bin/install`
+#               writes here once; every repo on that machine picks it up with
+#               no per-repo setup. This is the directory that makes delta
+#               available before a repo has ever seen it.
 #   ext         file extension
 #   naming      prefix -> delta-explore.<ext>        invoked /delta-explore
 #               subdir -> delta/explore.<ext>        invoked /delta:explore
@@ -31,6 +38,7 @@ adapters:
   - id: claude
     name: Claude Code
     dir: .claude/commands
+    user_dir: .claude/commands
     ext: md
     naming: prefix
     format: frontmatter
@@ -39,12 +47,13 @@ adapters:
     verified: 2026-08-26
     docs: https://code.claude.com/docs/en/slash-commands
     invoke: /delta-explore
-    note: Docs define a command name as the file name without extension, and subdirectory namespacing has a standing bug report, so files are emitted flat with a delta- prefix rather than as delta/explore.md.
+    note: Docs define a command name as the file name without extension, and subdirectory namespacing has a standing bug report, so files are emitted flat with a delta- prefix rather than as delta/explore.md. User-level ~/.claude/commands/ is documented as personal, cross-project, never committed - exactly what delta/bin/install targets.
     install: none
 
   - id: gemini
     name: Gemini CLI
     dir: .gemini/commands
+    user_dir: .gemini/commands
     ext: toml
     naming: subdir
     format: toml
@@ -53,12 +62,13 @@ adapters:
     verified: 2026-08-26
     docs: https://geminicli.com/docs/cli/custom-commands/
     invoke: /delta:explore
-    note: Subdirectories namespace with a colon, so delta/explore.toml becomes /delta:explore. Required key is prompt; description is optional and included.
+    note: Subdirectories namespace with a colon, so delta/explore.toml becomes /delta:explore. Required key is prompt; description is optional and included. Docs describe both a global ~/.gemini/commands/ (all sessions) and a project .gemini/commands/ (that project only), with project taking precedence - the split this table now models for every adapter.
     install: none
 
   - id: antigravity
     name: Antigravity CLI
     dir: .agents/skills
+    user_dir: .gemini/config/skills
     ext: md
     naming: prefix
     format: frontmatter
@@ -68,11 +78,13 @@ adapters:
     docs: https://antigravity.google/docs/cli/plugins/
     invoke: /delta-explore
     note: Workspace skills live in .agents/skills and stay with the repository. A project still carrying .gemini/skills should rename that folder to .agents/skills.
+    user_dir_verified: single secondary source (no official doc reachable from this environment's egress proxy); confirm against Antigravity's own docs before relying on it. If wrong, this is a one-line fix in this table.
     install: none
 
   - id: codex
     name: Codex
     dir: .codex/prompts
+    user_dir: .codex/prompts
     ext: md
     naming: prefix
     format: frontmatter
@@ -81,5 +93,5 @@ adapters:
     verified: 2026-08-26
     docs: https://developers.openai.com/codex/custom-prompts
     invoke: /delta-explore
-    note: Codex loads prompts from $CODEX_HOME/prompts only; project-scoped .codex/prompts is an open feature request, not shipped. Files are emitted here so they are versioned and reviewable, and so they work unchanged if that lands. Codex reads AGENTS.md from the repo natively, which is the path that works today.
-    install: ln -s "$PWD/.codex/prompts"/delta-*.md ~/.codex/prompts/
+    note: Codex loads prompts from $CODEX_HOME/prompts only - project-scoped .codex/prompts is an open feature request, not shipped. That makes user_dir the ONLY location that has ever worked for Codex; dir/project-level output is emitted anyway so it is versioned and ready if project-scoped loading lands, but delta/bin/install writing to user_dir is what actually makes /delta-explore appear in Codex today. Codex reads AGENTS.md from the repo natively regardless.
+    install: none

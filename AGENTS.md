@@ -3,7 +3,9 @@
 ## Changing this system
 
 Changes to existing behaviour go through delta, a spec lifecycle that lives in
-`delta/`. Nothing needs installing; it is files plus one POSIX `sh` script.
+`delta/`. The five commands install once per machine (`delta/bin/install`);
+`delta/` itself is created lazily, by `propose`, the first time it runs here —
+there is no separate init step.
 
 1. **explore** — read the affected code and write findings to
    `delta/changes/<id>/explore.md`, including what could not be determined.
