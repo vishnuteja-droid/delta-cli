@@ -303,17 +303,43 @@ spec shaped to be easy to satisfy rather than one that says what is needed.
 
 ## Nothing is written without approval
 
-Present the spec and every check as a diff, and wait.
+Present the spec and every check as a real diff, and wait.
 
 The checks especially: they are the standard the work will be measured against,
 and they were written by a model. A reviewer must see each one before it lands.
 Write nothing to disk until the user approves. If they change a criterion,
 change its check with it.
 
+## Render the diff, don't describe it
+
+This is the screen where a developer makes the most important decision in the
+whole lifecycle. It does not get to look like plain text.
+
+Wrap it in a fenced ` ```diff ` block, one per file, unified-diff form — `+`
+for an added line, `-` for a removed one, a leading space for unchanged
+context, and a `@@` hunk header where useful. Every terminal and editor that
+renders markdown already colours a `diff` fence correctly — green add, red
+remove, dim context — without any escape code of your own, which is more
+reliable than emitting raw ANSI into a chat response and hoping it survives.
+
+```diff
+--- /dev/null
++++ b/delta/changes/webhook-idempotency/checks/C3-no-second-row.sh
+@@ -0,0 +1,5 @@
++#!/bin/sh
++# CRITERION: C3 duplicate webhook does not create a second ledger row
++curl -sf -X POST localhost:8081/webhook/retry -d @fixtures/dup.json > /dev/null
++test "$(psql -tAc "select count(*) from ledger_entry where provider_ref='X1'")" = "1"
+```
+
+Head each file's block with its path as a one-line comment above the fence
+(`spec.md`, then each `checks/C<n>-*.sh` in order) so a reviewer scanning past
+the syntax highlighting still knows what they're looking at.
+
 ## Print to the terminal
 
 The spec sections with counts, the criteria list, and the questions you need
-answered. Then the diff.
+answered. Then the diff, rendered as above.
 
 ## Signature frame — print this last
 

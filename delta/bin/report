@@ -9,14 +9,9 @@
 # dependency beyond a POSIX sh + awk that already has to exist for verify to
 # run at all. Open the file, read it, close it.
 #
-# Palette note: this reads "the shared palette defined in CR-004" in its own
-# spec, but no such artifact exists in this repository's history - CR-004 was
-# never produced. The palette below is derived directly from this CR's own
-# inline description (dark warm-black ground, terracotta accent, monospace,
-# state colours identical to the CLI) and from delta/bin/verify's actual
-# C_PASS/C_FAIL/C_DIM scheme. If a real CR-004 palette exists elsewhere,
-# the values are collected in one place below and nowhere else, so swapping
-# them is a small, local change.
+# Palette: sourced from delta/bin/palette.sh, the one file both this script
+# and delta/bin/verify read colours and glyphs from. Introduced by CR-004,
+# which also built the terminal side. Nothing below hardcodes a colour.
 #
 # Four questions, nothing else - see delta/changes/*/checks for what proves
 # each one:
@@ -232,13 +227,16 @@ manual_signed_n=${manual_signed_n:-0}; nocheck_n=${nocheck_n:-0}
 suspicious_n=${suspicious_n:-0}
 
 # ------------------------------------------------------------ palette ------
-# See the header comment: this is this CR's own inline description, turned
-# into concrete values, plus delta/bin/verify's actual C_PASS/C_FAIL/C_DIM
-# scheme. One place; change it here if a real shared palette ever exists.
-BG='#1b1613'; BG_PANEL='#221c18'; RULE='#4a4038'
-FG='#e9e1d6'; FG_DIM='#9a8f83'
-ACCENT='#c9714f'
-PASS='#7fb069'; FAIL='#d9634f'
+# The one file that knows what colour anything is - see its own header.
+# delta/bin/verify sources the same file for the terminal side, so the same
+# run reads as the same colours whether you watched it happen or opened
+# this page afterward. Neither script may hardcode a colour outside it.
+. "$script_dir/palette.sh"
+BG=$(palette_hex "$PALETTE_RGB_BG");             BG_PANEL=$(palette_hex "$PALETTE_RGB_BG_PANEL")
+RULE=$(palette_hex "$PALETTE_RGB_RULE")
+FG=$(palette_hex "$PALETTE_RGB_FG");              FG_DIM=$(palette_hex "$PALETTE_RGB_FG_DIM")
+ACCENT=$(palette_hex "$PALETTE_RGB_ACCENT")
+PASS=$(palette_hex "$PALETTE_RGB_PASS");          FAIL=$(palette_hex "$PALETTE_RGB_FAIL")
 MONO="ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace"
 
 esc() {  # minimal HTML-escape for text interpolated into the page
@@ -429,7 +427,7 @@ if [ "$n_change_rows" -eq 0 ]; then
 else
     printf '<svg viewBox="0 0 640 %s" width="100%%" height="%s" role="img" aria-label="checks versus MANUAL criteria per change">\n' \
         "$((n_change_rows * 22 + 6))" "$((n_change_rows * 22 + 6))"
-    awk -F'\t' -v OFS='\t' '
+    awk -F'\t' -v OFS='\t' -v fgdim="$FG_DIM" '
         {
             ch = $1; a = $2 + 0; m = $3 + 0
             t = a + m
@@ -439,7 +437,7 @@ else
             mw = 380 * (m / t)
             label = ch
             if (length(label) > 28) label = substr(label, 1, 27) "\xe2\x80\xa6"
-            printf "  <text x=\"0\" y=\"%d\" fill=\"#9a8f83\" font-size=\"11\">%s</text>\n", y + 10, label
+            printf "  <text x=\"0\" y=\"%d\" fill=\"%s\" font-size=\"11\">%s</text>\n", y + 10, fgdim, label
             printf "  <rect class=\"bar-auto\" x=\"260\" y=\"%d\" width=\"%.1f\" height=\"14\"><title>%s: %d check(s)</title></rect>\n", y, aw, ch, a
             printf "  <rect class=\"bar-manual\" x=\"%.1f\" y=\"%d\" width=\"%.1f\" height=\"14\"><title>%s: %d MANUAL</title></rect>\n", 260 + aw, y, mw, ch, m
         }

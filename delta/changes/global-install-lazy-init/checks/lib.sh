@@ -2,6 +2,7 @@
 # criterion.
 
 RUNNER_SRC=${RUNNER_SRC:-$PWD/delta/bin/verify}
+PALETTE_SRC=${PALETTE_SRC:-$PWD/delta/bin/palette.sh}
 
 # mk_fixture_repo <dir> [runner-version]
 # A minimal but complete "repo": a .git marker, delta/{truth,changes,bin/verify},
@@ -11,6 +12,7 @@ mk_fixture_repo() {
     d=$1; ver=${2:-}
     mkdir -p "$d/.git" "$d/delta/truth" "$d/delta/bin" "$d/delta/changes/fx/checks"
     cp "$RUNNER_SRC" "$d/delta/bin/verify"
+    cp "$PALETTE_SRC" "$d/delta/bin/palette.sh"
     if [ -n "$ver" ]; then
         sed "s/^RUNNER_VERSION=.*/RUNNER_VERSION=$ver/" "$d/delta/bin/verify" > "$d/delta/bin/verify.new"
         mv "$d/delta/bin/verify.new" "$d/delta/bin/verify"

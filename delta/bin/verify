@@ -71,6 +71,12 @@ TAB=$(printf "\t")
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 4
 
+# The one file that knows what colour or glyph anything is - see its own
+# header. Sourced from a fixed, known-good location (this script's own
+# directory), not searched for, so a bad cwd can never silently pick up a
+# different one.
+. "$script_dir/palette.sh"
+
 die() {
     printf '  delta verify: %s\n' "$1" >&2
     exit 4
@@ -145,7 +151,12 @@ esac
 cols=0
 case "${COLUMNS-}" in ''|*[!0-9]*) : ;; *) cols=$COLUMNS ;; esac
 if [ "$cols" -eq 0 ] && command -v tput >/dev/null 2>&1; then
-    cols=$(tput cols 2>/dev/null) || cols=0
+    # /dev/tty, not a bare `tput cols`: this value is also read again later
+    # from inside a piped while-read loop, where the loop body's own stdin
+    # is the pipe, not the terminal - tput queries via stdin and silently
+    # falls back to a wrong default (typically 80) if it is not a tty.
+    # Querying /dev/tty directly works from both contexts identically.
+    cols=$(tput cols 2>/dev/null </dev/tty) || cols=0
 fi
 case "$cols" in ''|*[!0-9]*) cols=0 ;; esac
 [ "$cols" -lt 40 ] && cols=80
@@ -157,29 +168,79 @@ if [ "$is_tty" -eq 1 ] && sleep 0.1 2>/dev/null; then
 fi
 
 if [ "$unicode" -eq 1 ]; then
-    G_PASS='✓'; G_FAIL='✗'; G_MAN='○'; G_PEND='·'
-    G_REPRO='◆'; G_SUSP='!'; G_ERR='⚠'
-    SIG='Δ'; RULE='─'; SEP='·'; ELL='…'
-    SPIN='⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏'
+    G_PASS=$PALETTE_GLYPH_PASS_UTF8;   G_FAIL=$PALETTE_GLYPH_FAIL_UTF8
+    G_MAN=$PALETTE_GLYPH_MANUAL_UTF8;  G_PEND=$PALETTE_GLYPH_PENDING_UTF8
+    G_REPRO=$PALETTE_GLYPH_REPRO_UTF8; G_SUSP=$PALETTE_GLYPH_SUSPICIOUS_UTF8
+    G_ERR=$PALETTE_GLYPH_ERROR_UTF8
+    SIG=$PALETTE_SIGIL_UTF8; RULE=$PALETTE_RULE_UTF8
+    SEP=$PALETTE_SEP_UTF8;   ELL=$PALETTE_ELLIPSIS_UTF8
+    SPIN=$PALETTE_SPIN_UTF8
     GLYPH_W=1
 else
-    G_PASS='[ok]'; G_FAIL='[FAIL]'; G_MAN='[man]'; G_PEND='...'
-    G_REPRO='[rep]'; G_SUSP='[!!]'; G_ERR='[err]'
-    SIG='d'; RULE='-'; SEP='-'; ELL='~'
-    SPIN='- \ | /'
+    G_PASS=$PALETTE_GLYPH_PASS_ASCII;   G_FAIL=$PALETTE_GLYPH_FAIL_ASCII
+    G_MAN=$PALETTE_GLYPH_MANUAL_ASCII;  G_PEND=$PALETTE_GLYPH_PENDING_ASCII
+    G_REPRO=$PALETTE_GLYPH_REPRO_ASCII; G_SUSP=$PALETTE_GLYPH_SUSPICIOUS_ASCII
+    G_ERR=$PALETTE_GLYPH_ERROR_ASCII
+    SIG=$PALETTE_SIGIL_ASCII; RULE=$PALETTE_RULE_ASCII
+    SEP=$PALETTE_SEP_ASCII;   ELL=$PALETTE_ELLIPSIS_ASCII
+    SPIN=$PALETTE_SPIN_ASCII
     GLYPH_W=6
 fi
 
 SPIN_N=0
 for _f in $SPIN; do SPIN_N=$((SPIN_N + 1)); done
 
+# Truecolor: only used for the gradient rule, and only when colour is on at
+# all (so NO_COLOR and non-TTY both disable it along with everything else).
+# COLORTERM is the one portable signal for 24-bit support - there is no
+# universal `tput` query for it.
+use_truecolor=0
 if [ "$use_color" -eq 1 ]; then
-    C_PASS=$(printf '\033[32m'); C_FAIL=$(printf '\033[31m')
-    C_DIM=$(printf '\033[2m');   C_OFF=$(printf '\033[0m')
-    CLEAR=$(printf '\r\033[2K')
-else
-    C_PASS=''; C_FAIL=''; C_DIM=''; C_OFF=''; CLEAR=''
+    case "${COLORTERM-}" in truecolor|24bit) use_truecolor=1 ;; esac
 fi
+
+if [ "$use_color" -eq 1 ]; then
+    C_PASS=$(printf '\033[%sm' "$PALETTE_ANSI_PASS")
+    C_FAIL=$(printf '\033[%sm' "$PALETTE_ANSI_FAIL")
+    C_DIM=$(printf '\033[%sm' "$PALETTE_ANSI_DIM")
+    if [ "$use_truecolor" -eq 1 ]; then
+        C_ACCENT=$(printf '\033[%sm' "$(palette_ansi_truecolor "$PALETTE_RGB_ACCENT")")
+    else
+        C_ACCENT=$(printf '\033[%sm' "$PALETTE_ANSI_ACCENT")
+    fi
+    C_OFF=$(printf '\033[0m')
+    CLEAR=$(printf '\r\033[2K')
+    CURSOR_HIDE=$(printf '\033[?25l')
+    CURSOR_SHOW=$(printf '\033[?25h')
+else
+    C_PASS=''; C_FAIL=''; C_DIM=''; C_ACCENT=''; C_OFF=''; CLEAR=''
+    CURSOR_HIDE=''; CURSOR_SHOW=''
+fi
+
+# Restore the terminal on every exit path - the single most likely bug in
+# terminal code is a cursor left invisible after Ctrl-C. This has to be set
+# up before anything ever hides the cursor, and it must be unconditional:
+# even a no-colour run prints CURSOR_SHOW (which is empty in that case, so
+# the trap is always safe to fire).
+restore_terminal() {
+    printf '%s%s' "$CURSOR_SHOW" "$C_OFF"
+}
+
+# A signal delivered to this shell does not automatically reach a
+# backgrounded check subprocess - `cpid` (set right before each check is
+# started, cleared right after) has to be killed explicitly, or Ctrl-C
+# leaves the check running to completion in the background while the parent
+# exits, which is worse than doing nothing: the terminal looks free but a
+# check is still writing to the log underneath it.
+cpid=''
+on_signal() {
+    echo "on_signal fired at $(date +%s.%N)" >> /tmp/claude-0/-home-user-delta-cli/5d28aa46-dea9-5137-bfb0-4ea5bbf6a1e4/scratchpad/trapdebug.log
+    [ -n "$cpid" ] && kill "$cpid" 2>/dev/null
+    restore_terminal
+}
+trap restore_terminal EXIT
+trap 'on_signal; trap - INT; kill -INT $$' INT
+trap 'on_signal; trap - TERM; kill -TERM $$' TERM
 
 # ------------------------------------------------------------- utilities ----
 
@@ -206,16 +267,61 @@ trunc() {  # truncate $1 to width $2, never wrap
     printf '%s' "$_s"
 }
 
+# gradient_rule <n> - the rule character n times, faded left to right from
+# the accent colour to the dim foreground. Truecolor only (see use_truecolor
+# above); everything else gets the plain flat dim rule in rule_line below.
+# Integer RGB interpolation - no floating point in POSIX arithmetic, and at
+# rule-line lengths (tens of characters) the rounding is invisible.
+gradient_rule() {
+    _n=$1
+    [ "$_n" -le 0 ] && return 0
+    set -- $PALETTE_RGB_ACCENT;  _ar=$1; _ag=$2; _ab=$3
+    set -- $PALETTE_RGB_FG_DIM;  _dr=$1; _dg=$2; _db=$3
+    _i=0
+    while [ "$_i" -lt "$_n" ]; do
+        if [ "$_n" -gt 1 ]; then
+            _gr=$(( _ar + (_dr - _ar) * _i / (_n - 1) ))
+            _gg=$(( _ag + (_dg - _ag) * _i / (_n - 1) ))
+            _gb=$(( _ab + (_db - _ab) * _i / (_n - 1) ))
+        else
+            _gr=$_ar; _gg=$_ag; _gb=$_ab
+        fi
+        printf '\033[38;2;%s;%s;%sm%s' "$_gr" "$_gg" "$_gb" "$RULE"
+        _i=$((_i + 1))
+    done
+    printf '%s' "$C_OFF"
+}
+
 rule_line() {  # signature frame: two spaces, sigil, rule, right-hand label
-    _label=$1
+    # $2, if passed, is a colour to wrap the whole line in (the completion
+    # moment - accent on a clean run) instead of the default dim/plain rule.
+    # $3, if the label ($1) contains embedded colour codes, is the plain
+    # (uncoloured) equivalent to measure and truncate against - escape
+    # sequences are zero-width on screen but count as characters in ${#_s},
+    # so width math has to use the plain text even when display uses $1.
+    _label=$1; _linecolor=${2:-}; _plain=${3:-$1}
     _maxlabel=$((cols - 4 - 2 - 3))
     [ "$_maxlabel" -lt 8 ] && _maxlabel=8
-    [ ${#_label} -gt "$_maxlabel" ] && _label=$(trunc "$_label" "$_maxlabel")
-    _avail=$((cols - 4 - ${#_label} - 2))
+    if [ ${#_plain} -gt "$_maxlabel" ]; then
+        _plain=$(trunc "$_plain" "$_maxlabel")
+        _label=$_plain
+    fi
+    _avail=$((cols - 4 - ${#_plain} - 2))
     [ "$_avail" -lt 3 ] && _avail=3
-    _r=''; _i=0
-    while [ "$_i" -lt "$_avail" ]; do _r="$_r$RULE"; _i=$((_i + 1)); done
-    printf '  %s %s  %s\n' "$SIG" "$_r" "$_label"
+    if [ "$use_truecolor" -eq 1 ] && [ -z "$_linecolor" ]; then
+        _r=$(gradient_rule "$_avail")
+    else
+        _r=''; _i=0
+        while [ "$_i" -lt "$_avail" ]; do _r="$_r$RULE"; _i=$((_i + 1)); done
+        [ -n "$_linecolor" ] && _r="$_linecolor$_r$C_OFF"
+    fi
+    # _linecolor wraps only the sigil and rule dashes, never the label: the
+    # label may already carry its own embedded colour spans (the summary's
+    # per-count green/red), and nesting a wrapper around those would have
+    # the label's own trailing reset cancel the wrapper's colour partway
+    # through instead of restoring it - ANSI resets go to terminal default,
+    # never back to "whatever was active before".
+    printf '  %s %s  %s\n' "${_linecolor}${SIG}${_linecolor:+$C_OFF}" "$_r" "$_label"
 }
 
 now_ms() {
@@ -433,17 +539,36 @@ printf '%s\n' "$CRITERIA" | while IFS='	' read -r id kind desc; do
 
     t0=$(now_ms)
     if [ "$spinner_ok" -eq 1 ]; then
+        printf '%s' "$CURSOR_HIDE"
         ( cd "$ROOT" && DELTA_CHANGE_DIR="$CHANGE_DIR" DELTA_CHECK_DIR="$CHECKS_DIR" \
             DELTA_RUN_DIR="$RUN_DIR" DELTA_CRITERION="$id" exec "$chk" ) >"$log" 2>&1 &
         cpid=$!
         i=0
         while kill -0 "$cpid" 2>/dev/null; do
-            printf '\r  %s %s %s' "$(spin_frame "$i")" \
-                "$(pad "$id" "$idw")" "$(trunc "$desc" "$descw")"
+            # Recomputed every tick, not cached from script start: a resize
+            # mid-run must not corrupt this line. Cheap enough at 0.1s.
+            _cols=0
+            case "${COLUMNS-}" in ''|*[!0-9]*) : ;; *) _cols=$COLUMNS ;; esac
+            if [ "$_cols" -eq 0 ] && command -v tput >/dev/null 2>&1; then
+                _cols=$(tput cols 2>/dev/null </dev/tty) || _cols=0
+            fi
+            case "$_cols" in ''|*[!0-9]*) _cols=0 ;; esac
+            [ "$_cols" -lt 40 ] && _cols=80
+            [ "$_cols" -gt 100 ] && _cols=100
+            cols=$_cols
+            _live_descw=$((cols - 2 - GLYPH_W - 1 - 8 - idw - 2 - 6))
+            [ "$_live_descw" -lt 8 ] && _live_descw=8
+
+            _elapsed_ms=$(( $(now_ms) - t0 ))
+            _es=$((_elapsed_ms / 1000))
+            printf '\r  %s running  %s %s %s' "$(spin_frame "$i")" \
+                "$(pad "$id" "$idw")" "$(trunc "$desc" "$_live_descw")" \
+                "$(pad_left "$((_es / 60)):$(printf '%02d' "$((_es % 60))")" 6)"
             i=$((i + 1))
             sleep 0.1
         done
         wait "$cpid"; rc=$?
+        cpid=''
     else
         [ "$is_tty" -eq 0 ] || printf '  %s %s %s\n' "$(pad "$G_PEND" "$GLYPH_W")" \
             "$(pad "$id" "$idw")" "$(trunc "$desc" "$descw")"
@@ -596,14 +721,37 @@ if [ -s "$FAILLOG" ]; then
 fi
 
 if [ "$total" -eq 1 ]; then _noun=criterion; else _noun=criteria; fi
-summary="$total $_noun $SEP $passed passed"
-[ "$failed"     -gt 0 ] && summary="$summary $SEP $failed failed"
+
+# The completion moment: clean vs failing is the one distinction the
+# developer is actually waiting for, so it gets one beat of visual
+# difference - never the whole line in red, only the count(s) that are
+# actually wrong, and never colour applied to a plain terminal/no-colour run
+# (C_PASS/C_FAIL/C_ACCENT are already '' there, so this degrades for free).
+run_clean=1
+[ "$errored"     -gt 0 ] && run_clean=0
+[ "$failed"      -gt 0 ] && run_clean=0
+[ "$suspicious"  -gt 0 ] && run_clean=0
+[ "$unchecked"   -gt 0 ] && run_clean=0
+[ "$manual_open" -gt 0 ] && run_clean=0
+[ "$archive_gate" -eq 1 ] && [ "$reproduced" -gt 0 ] && run_clean=0
+
+if [ "$run_clean" -eq 1 ]; then
+    summary="$total $_noun $SEP ${C_PASS}${passed} passed${C_OFF}"
+else
+    summary="$total $_noun $SEP $passed passed"
+fi
+[ "$failed"     -gt 0 ] && summary="$summary $SEP ${C_FAIL}${failed} failed${C_OFF}"
 [ "$reproduced" -gt 0 ] && summary="$summary $SEP $reproduced reproduced"
-[ "$suspicious" -gt 0 ] && summary="$summary $SEP $suspicious suspicious"
-[ "$errored"    -gt 0 ] && summary="$summary $SEP $errored error(s)"
-[ "$unchecked" -gt 0 ] && summary="$summary $SEP $unchecked unchecked"
-[ "$manual"    -gt 0 ] && summary="$summary $SEP $manual manual"
+[ "$suspicious" -gt 0 ] && summary="$summary $SEP ${C_FAIL}${suspicious} suspicious${C_OFF}"
+[ "$errored"    -gt 0 ] && summary="$summary $SEP ${C_FAIL}${errored} error(s)${C_OFF}"
+[ "$unchecked"  -gt 0 ] && summary="$summary $SEP ${C_FAIL}${unchecked} unchecked${C_OFF}"
+[ "$manual"     -gt 0 ] && summary="$summary $SEP $manual manual"
 summary="$summary $SEP $(fmt_dur "$run_ms")"
+
+# The colour codes above are for the terminal only - strip them before this
+# same string is written to summary.txt or measured for width, so the log
+# stays plain text and column math is never thrown off by invisible bytes.
+summary_plain=$(printf '%s' "$summary" | sed 's/\x1b\[[0-9;]*m//g')
 
 # The archive gate names what is outstanding, because "cannot archive" without
 # the list is a dead end for whoever reads it.
@@ -617,10 +765,14 @@ if [ "$archive_gate" -eq 1 ] && [ "$reproduced" -gt 0 ]; then
 fi
 
 printf '\n'
-rule_line "$summary"
+if [ "$run_clean" -eq 1 ]; then
+    rule_line "$summary" "$C_ACCENT" "$summary_plain"
+else
+    rule_line "$summary" '' "$summary_plain"
+fi
 
 {
-    printf '%s\n' "$summary"
+    printf '%s\n' "$summary_plain"
     printf 'change: %s\n' "$label"
     printf 'run: %s\n' "$started_utc"
 } > "$RUN_DIR/summary.txt"

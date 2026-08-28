@@ -260,6 +260,8 @@ generated or copied in automatically by anything:
 delta/
   constitution.md          hand-written, inherited by every change
   bin/verify               committed - the only copy of the runner that exists
+  bin/palette.sh           colours and glyphs, the only place either live
+  bin/report               reads run/, writes delta/report.html (see below)
   truth/                   current understanding; only archive writes here
   changes/<id>/
     explore.md             findings, including known unknowns
@@ -426,6 +428,74 @@ Degradation is a requirement, not polish:
   `[ok]` `[FAIL]` `[rep]` `[!!]` `[err]` `[man]` `...` for the glyphs. Detected from `LC_ALL`/`LANG`.
 - **narrow terminal** — descriptions and detail lines truncate rather than
   wrap, columns stay aligned, and the frame never wraps to a second line.
+
+### Presence
+
+A tool people run twenty times a day should feel like something is
+happening, not print a frame and go quiet. While a check runs, one line
+updates in place — a verb, the check, and how long:
+
+```
+    ⠹ running  C3 duplicate creates no second row         0:03
+```
+
+Recomputed every tick, not cached from when the run started, so a mid-run
+terminal resize doesn't leave the line corrupted or wrapped.
+
+On a truecolor terminal (`COLORTERM=truecolor` or `24bit`), the rule fades
+left to right from the accent colour to the dim foreground — the one purely
+decorative effect here, and it's the reason for the "degrades silently"
+rule: 256- and 16-colour terminals just get the plain flat rule, no error,
+no fallback glyph, nothing to notice.
+
+A clean run's closing frame prints in the accent colour; a failing run
+highlights only the specific non-zero counts in red — never the whole line,
+and the frame itself only when everything passed. One beat of visual
+difference for the distinction actually worth noticing at a glance.
+
+`INT`, `TERM`, and normal exit all restore cursor visibility and reset
+colour, unconditionally — a tool that leaves the cursor invisible after
+Ctrl-C stops being trusted fast. Confirmed by sending a real terminal
+interrupt byte into a live pty (not `kill -INT` on a PID, which doesn't
+reproduce how a terminal actually delivers Ctrl-C to a foreground process
+group) and reading the byte stream: cursor-show and colour-reset both
+appear immediately, and the process exits via the signal, not by finishing
+the check it was running. The one known gap: this reaches the check's own
+process reliably, but not a grandchild a check spawns internally (a check
+that itself runs `sleep`, say) — delta can't reach into an arbitrary
+check's own process tree. Rare, since most checks are one synchronous
+command, and worth knowing rather than quietly claiming perfect cleanup.
+
+Only `verify` gets any of this literally — it's a real process with real
+signal and terminal control. `explore`, `propose`, `apply`, and `archive`
+are agent-executed prompts, not processes: they can't trap a signal or
+truly rewrite a line in place with a running clock, and claiming otherwise
+would be asserting behaviour delta cannot verify across every host CLI.
+What they get instead is the same spirit, honestly: progress and results
+printed as the work happens rather than batched at the end, using a small
+set of verbs chosen to match what's actually happening (`reading`,
+`tracing`, `writing`) — never sampled for whimsy, since a verb that lies
+about the operation is worse than no verb.
+
+`propose`'s review screen — the one where a developer makes the most
+important decision in the lifecycle — renders the spec and every check as
+a real diff: fenced ` ```diff ` blocks, unified-diff form, one per file.
+Every terminal and editor that renders markdown already colours a `diff`
+fence correctly, which is more reliable than an agent emitting raw ANSI
+into a chat response and hoping it survives whatever the host does to it.
+
+### One palette, two surfaces
+
+`delta/bin/palette.sh` is the only file that defines a colour or a glyph —
+RGB triples, the portable 16-colour ANSI numbers, and the unicode/ASCII
+glyph pairs. `delta/bin/verify` (terminal) and `delta/bin/report` (HTML)
+both source it and derive what they need (`palette_hex` for CSS,
+`palette_ansi_truecolor` for the gradient); neither hardcodes a colour of
+its own. The point: the same run has to look like the same run whether you
+watched it happen or opened the HTML report afterward. Passed and fixed are
+green in both; failed, suspicious, and error are red in both; manual and
+pending are dim in both; reproduced is the plain foreground in both — not
+approximately matching colours picked twice, the same values read once.
 
 ## Verifying delta itself
 

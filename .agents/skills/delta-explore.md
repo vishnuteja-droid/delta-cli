@@ -111,16 +111,29 @@ command's job and doing it here contaminates it.
 
 ## Print to the terminal
 
-If a findings file was written, print the condensed form between the frames —
-not the whole file:
+Print each line as you find it, not batched at the end. A finding printed
+after you already know it is a status report; a finding printed as you
+establish it is what makes the four-minute explore look different from a
+stalled one.
 
+     reading   PaymentController.java
      entry    PaymentController.dispatch
+     tracing   eapi → papi
      chain    eapi → papi → sapi → ledger
      unknown  retry count comes from config
 
-Three-space indent, label column padded to 8, then the value. One line per
-item. If there are more than about eight lines, print the entry points and the
-unknowns and say how many other findings are in the file.
+Two kinds of line, and only these verbs: `reading` a file you are currently
+in, `tracing` a call chain as you follow it — both transient, a note of what
+you are doing right now, not a finding. `entry`, `chain`, `unknown` are the
+findings themselves, kept once written. Three-space indent, label column
+padded to 8, then the value. If there are more than about eight findings,
+print the entry points and the unknowns and say how many others are in the
+file.
+
+This is composed response text, not a live-updating terminal line — unlike
+`verify`, a real process with a real spinner, there is nothing here that
+rewrites in place with a running clock. Do not claim otherwise; print each
+line once, in order, as the work happens.
 
 If no `delta/` exists and nothing was written, print the full findings in that
 same format instead of a condensed version of them — the terminal is the only

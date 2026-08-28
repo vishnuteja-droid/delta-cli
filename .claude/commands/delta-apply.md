@@ -79,11 +79,20 @@ something implementable.
 
 ## Print to the terminal
 
-One line per item as you complete it: the section, the item, and the files
-touched.
+Before starting an item, print one transient line naming the file: `writing
+WebhookController.java`. Then, one line per item as you complete it: the
+section, the item, and the files touched.
 
+     writing   WebhookController.java
      ADDED     idempotency key on webhook receipt   WebhookController.java
+     writing   LedgerRepository.java
      MODIFIED  ledger insert guarded by key         LedgerRepository.java
+
+Print the completed-item line the moment the item is done, not batched at the
+end — the whole point is that the screen shows progress, not a report filed
+afterward. This is composed response text, not a live-updating terminal
+line: there is no real spinner or running clock here the way `verify` has one,
+so don't imply one. One line per event, in order.
 
 ## Signature frame — print this last
 

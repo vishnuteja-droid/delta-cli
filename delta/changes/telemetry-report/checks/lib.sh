@@ -3,6 +3,7 @@
 
 VERIFY_SRC=${VERIFY_SRC:-$PWD/delta/bin/verify}
 REPORT_SRC=${REPORT_SRC:-$PWD/delta/bin/report}
+PALETTE_SRC=${PALETTE_SRC:-$PWD/delta/bin/palette.sh}
 
 # mk_repo <dir>
 # An empty but valid repo: .git marker, delta/bin/{verify,report}, no changes.
@@ -10,6 +11,7 @@ mk_repo() {
     d=$1
     mkdir -p "$d/.git" "$d/delta/bin" "$d/delta/changes"
     cp "$VERIFY_SRC" "$d/delta/bin/verify"; chmod +x "$d/delta/bin/verify"
+    cp "$PALETTE_SRC" "$d/delta/bin/palette.sh"
     cp "$REPORT_SRC" "$d/delta/bin/report"; chmod +x "$d/delta/bin/report"
 }
 
