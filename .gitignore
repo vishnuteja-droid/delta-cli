@@ -3,3 +3,7 @@
 # reproduced/fixed ledger - live directly in run/ and are tracked, because
 # they must survive a fresh clone. The per-run directories are not.
 delta/changes/*/run/*/
+
+# Generated from the (gitignored) run/ directories above by delta/bin/report.
+# Local history, regenerated on demand - not source.
+delta/report.html

@@ -437,9 +437,58 @@ throwaway fixtures and assert each exit code.
 delta/bin/verify example-verify-exit-codes
 ```
 
+## The telemetry report
+
+The live workflow UI stays deferred — a static page can't carry buttons or
+stream a run, and every fix for that costs a runtime dependency. Telemetry is
+different: it's entirely backward-looking, so a generated file is the
+correct shape, not a compromise.
+
+```sh
+delta/bin/report
+```
+
+Reads `delta/changes/*/run/` and writes `delta/report.html`. Open it, read
+it, close it — no server, no dependency beyond the `sh`/`awk` `verify`
+already needs, no live anything. Four questions, nothing else:
+
+1. **Is delta being used?** — changes started/archived, verify runs, a
+   sparkline once there's enough history to call it one.
+2. **Does verification catch anything?** — the percentage of ordinary
+   criteria that failed on verify. This is the number the tool is built on:
+   direct evidence, not an assertion, that agents report completion they
+   can't substantiate. It accumulates from runs you're already doing,
+   whether or not anyone opens the report.
+3. **How testable are our specs?** — criteria that compiled to a check vs
+   MANUAL, per change, oldest first.
+4. **What keeps breaking?** — criteria that failed more than once; bug
+   reproductions that took several attempts to turn green.
+
+Same honest-counting rules as `verify` itself: MANUAL is never a failure, a
+check that couldn't run is never mixed with one that failed to hold. Below
+`--min-runs` (default 5) the trend charts are replaced with a plain
+statement that there isn't enough history yet — the underlying numbers
+still show, since a single real data point isn't a fabricated trend. No
+`run/` data at all produces a valid, themed page saying so, not an error.
+
+Aggregate only, by design: no author, username, or per-developer anything,
+anywhere in the script or its output. If delta spreads, a per-developer
+breakdown is the fastest way to make people stop using it.
+
+Charts are inline SVG the script writes itself — no library, no CDN, no web
+font, no JavaScript. `delta/report.html` opens over `file://` with zero
+network requests, and is gitignored: it's generated from already-gitignored
+`run/` data, local history regenerated on demand, not source.
+
+**On the palette:** this reads "the shared palette defined in CR-004" in its
+own originating spec, but no such artifact exists in this repository's
+history. The dark warm-black ground, terracotta accent, and monospace
+throughout are this repo's own concrete choice; the state colours are taken
+directly from `delta/bin/verify`'s actual `C_PASS`/`C_FAIL`/`C_DIM` scheme
+so the report reads as the same tool, not a redesign.
+
 ## Deliberately not built
 
-The UI and telemetry over agentic runs — it needs recorded state first, which
-is why `verify` writes timestamps, durations, exit codes, captured output, and
-criterion ids. Also deferred: a code graph or impact analysis, an MCP server,
-multi-agent roles, and any hosted or networked component.
+The live workflow UI — see above for why, and for what shipped instead. Also
+deferred: a code graph or impact analysis, an MCP server, multi-agent roles,
+and any hosted or networked component.

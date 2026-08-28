@@ -1,0 +1,498 @@
+#!/bin/sh
+# delta report - read run/ across the repo's changes and write delta/report.html.
+#
+# Usage: delta/bin/report [--min-runs N]
+#
+# Entirely backward-looking: reads what delta/bin/verify already wrote under
+# delta/changes/*/run/, aggregates it, and writes one self-contained HTML
+# file. No server, no live data, no JavaScript, no network request, no
+# dependency beyond a POSIX sh + awk that already has to exist for verify to
+# run at all. Open the file, read it, close it.
+#
+# Palette note: this reads "the shared palette defined in CR-004" in its own
+# spec, but no such artifact exists in this repository's history - CR-004 was
+# never produced. The palette below is derived directly from this CR's own
+# inline description (dark warm-black ground, terracotta accent, monospace,
+# state colours identical to the CLI) and from delta/bin/verify's actual
+# C_PASS/C_FAIL/C_DIM scheme. If a real CR-004 palette exists elsewhere,
+# the values are collected in one place below and nowhere else, so swapping
+# them is a small, local change.
+#
+# Four questions, nothing else - see delta/changes/*/checks for what proves
+# each one:
+#   1. Is delta being used at all?
+#   2. Does verification catch anything? (the number the tool is built on)
+#   3. How testable are the specs? (checks vs MANUAL)
+#   4. What keeps breaking? (recurring failures, multi-attempt reproductions)
+#
+# Honest counting: MANUAL is never a failure. A check that could not run
+# (error) is never mixed with a criterion that failed to hold. Where there
+# is not enough history to chart a trend, the report says so instead of
+# drawing one.
+#
+# Aggregate only. No author, no username, no per-developer anything, by
+# design - see the CR's "Aggregate by default" section.
+
+set -u
+
+MIN_RUNS=5
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --min-runs) MIN_RUNS=${2:?--min-runs needs a number}; shift 2 ;;
+        --min-runs=*) MIN_RUNS=${1#--min-runs=}; shift ;;
+        --) shift; break ;;
+        -*) printf 'report: unknown option: %s\n' "$1" >&2; exit 1 ;;
+        *) break ;;
+    esac
+done
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+
+die() { printf 'report: %s\n' "$1" >&2; exit 1; }
+
+if [ -n "${DELTA_ROOT-}" ]; then
+    [ -d "$DELTA_ROOT" ] || die "DELTA_ROOT does not exist: $DELTA_ROOT"
+    ROOT=$(CDPATH= cd -- "$DELTA_ROOT" && pwd) || die "cannot resolve DELTA_ROOT"
+    [ -d "$ROOT/delta" ] || die "DELTA_ROOT has no delta/ directory: $ROOT"
+else
+    DELTA_DIR=$(dirname -- "$script_dir")
+    ROOT=$(dirname -- "$DELTA_DIR")
+fi
+CHANGES_DIR="$ROOT/delta/changes"
+OUT="$ROOT/delta/report.html"
+
+TMP=$(mktemp -d) || die "cannot make a temporary directory"
+trap 'rm -rf "$TMP"' EXIT
+
+# --------------------------------------------------------- gather ----------
+# flat.tsv: one row per criterion-result, across every run of every change.
+#   change  run_ts  criterion  status  duration_ms  description
+# runs.tsv: one row per run (not per criterion) - change and run_ts only.
+# changes.tsv: one row per change directory that has a spec.md.
+#   change  archived(1|0)  first_run_ts_or_dash  latest_run_ts_or_dash  n_runs
+
+: > "$TMP/flat.tsv"
+: > "$TMP/runs.tsv"
+: > "$TMP/changes.tsv"
+
+if [ -d "$CHANGES_DIR" ]; then
+    for specf in "$CHANGES_DIR"/*/spec.md; do
+        [ -f "$specf" ] || continue
+        chdir=$(dirname -- "$specf")
+        ch=${chdir##*/}
+
+        archived=0
+        head -n 1 "$specf" 2>/dev/null | grep -q '^archived:' && archived=1
+        # archived: can also appear as the first non-blank line after a
+        # title, so check the first few lines rather than only line 1.
+        [ "$archived" -eq 1 ] || { head -n 5 "$specf" 2>/dev/null | grep -q '^archived:' && archived=1; }
+
+        run_ts_list=""
+        if [ -d "$chdir/run" ]; then
+            for rtsv in "$chdir"/run/*/results.tsv; do
+                [ -f "$rtsv" ] || continue
+                rundir=$(dirname -- "$rtsv")
+                rts=${rundir##*/}
+                run_ts_list="$run_ts_list$rts
+"
+                printf '%s\t%s\n' "$ch" "$rts" >> "$TMP/runs.tsv"
+                awk -F'\t' -v ch="$ch" -v rts="$rts" '
+                    NR > 1 && NF >= 7 {
+                        print ch "\t" rts "\t" $1 "\t" $2 "\t" $5 "\t" $7
+                    }
+                ' "$rtsv" >> "$TMP/flat.tsv"
+            done
+        fi
+
+        if [ -n "$run_ts_list" ]; then
+            sorted=$(printf '%s' "$run_ts_list" | sort)
+            first=$(printf '%s\n' "$sorted" | head -n 1)
+            latest=$(printf '%s\n' "$sorted" | tail -n 1)
+            n=$(printf '%s\n' "$sorted" | grep -c .)
+        else
+            first="-"; latest="-"; n=0
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\n' "$ch" "$archived" "$first" "$latest" "$n" >> "$TMP/changes.tsv"
+    done
+fi
+
+sort -t'	' -k1,1 -k3,3 -k2,2 "$TMP/flat.tsv" > "$TMP/flat.sorted.tsv" 2>/dev/null || cp "$TMP/flat.tsv" "$TMP/flat.sorted.tsv"
+
+total_runs=$(wc -l < "$TMP/runs.tsv" | tr -d ' ')
+total_changes=$(wc -l < "$TMP/changes.tsv" | tr -d ' ')
+generated_utc=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+repo_name=${ROOT##*/}
+
+# day_counts.tsv: day \t count, one line per day that had at least one run,
+# sorted chronologically. Deliberately sparse - no fabricated zero-count days
+# between them, which would need calendar arithmetic this script avoids.
+if [ "$total_runs" -gt 0 ]; then
+    cut -f2 "$TMP/runs.tsv" | cut -c1-10 | sort | uniq -c \
+        | awk '{print $2 "\t" $1}' > "$TMP/day_counts.tsv"
+else
+    : > "$TMP/day_counts.tsv"
+fi
+
+# ------------------------------------------------------- aggregate ---------
+# Pass 1: changes.tsv first, to build per-change lookups; then
+# flat.sorted.tsv, tallying everything else against those lookups. Emits
+# small intermediate files rather than trying to hold this in shell
+# variables - each one is sorted and rendered independently below.
+
+: > "$TMP/scalars.txt"
+: > "$TMP/criterion_fail_counts.tsv"
+: > "$TMP/criterion_repro_counts.tsv"
+: > "$TMP/change_manual_ratio.tsv"
+
+awk -F'\t' -v OFS='\t' \
+    -v scalars="$TMP/scalars.txt" \
+    -v failcounts="$TMP/criterion_fail_counts.tsv" \
+    -v reprocounts="$TMP/criterion_repro_counts.tsv" \
+    -v manualratio="$TMP/change_manual_ratio.tsv" '
+    # ---- file 1: changes.tsv (change, archived, first_ts, latest_ts, n_runs)
+    FNR == NR {
+        latest_ts[$1] = $4
+        first_ts[$1] = $3
+        next
+    }
+
+    # ---- file 2: flat.sorted.tsv (change, run_ts, criterion, status, dur, desc)
+    {
+        change = $1; rts = $2; crit = $3; status = $4
+
+        if (status == "passed")        q2_passed++
+        else if (status == "failed")   { q2_failed++; failkey = change SUBSEP crit; fail_n[failkey]++ }
+        else if (status == "error")    error_n++
+        else if (status == "manual-open")   manual_open_n++
+        else if (status == "manual-signed") manual_signed_n++
+        else if (status == "no-check") nocheck_n++
+        else if (status == "reproduced") {
+            reprokey = change SUBSEP crit
+            repro_n[reprokey]++
+        }
+        else if (status == "suspicious") suspicious_n++
+        else if (status == "fixed") {
+            fixedkey = change SUBSEP crit
+            fixed_seen[fixedkey] = 1
+        }
+
+        # Q3: only the criterion set as it stands in each change'\''s latest
+        # run - earlier runs of the same change would double-count the same
+        # criteria under an older status.
+        if (rts == latest_ts[change]) {
+            mrkey = change
+            if (status == "manual-open" || status == "manual-signed") {
+                manual_ct[mrkey]++
+            } else if (status != "no-check") {
+                auto_ct[mrkey]++
+            }
+            seen_change[mrkey] = 1
+        }
+    }
+
+    END {
+        printf "q2_passed=%d\n",        q2_passed        > scalars
+        printf "q2_failed=%d\n",        q2_failed        > scalars
+        printf "error_n=%d\n",          error_n          > scalars
+        printf "manual_open_n=%d\n",    manual_open_n    > scalars
+        printf "manual_signed_n=%d\n",  manual_signed_n  > scalars
+        printf "nocheck_n=%d\n",        nocheck_n        > scalars
+        printf "suspicious_n=%d\n",     suspicious_n     > scalars
+
+        for (k in fail_n) {
+            if (fail_n[k] > 1) {
+                split(k, parts, SUBSEP)
+                print parts[1], parts[2], fail_n[k] >> failcounts
+            }
+        }
+        for (k in repro_n) {
+            if (repro_n[k] > 1) {
+                split(k, parts, SUBSEP)
+                fx = (k in fixed_seen) ? 1 : 0
+                print parts[1], parts[2], repro_n[k], fx >> reprocounts
+            }
+        }
+        for (k in seen_change) {
+            a = auto_ct[k] + 0
+            m = manual_ct[k] + 0
+            print k, a, m, first_ts[k] >> manualratio
+        }
+    }
+' "$TMP/changes.tsv" "$TMP/flat.sorted.tsv"
+
+sort -t'	' -k3,3nr "$TMP/criterion_fail_counts.tsv" -o "$TMP/criterion_fail_counts.tsv" 2>/dev/null
+sort -t'	' -k3,3nr "$TMP/criterion_repro_counts.tsv" -o "$TMP/criterion_repro_counts.tsv" 2>/dev/null
+sort -t'	' -k4,4 "$TMP/change_manual_ratio.tsv" -o "$TMP/change_manual_ratio.tsv" 2>/dev/null
+
+# shellcheck disable=SC1090
+. "$TMP/scalars.txt" 2>/dev/null || true
+q2_passed=${q2_passed:-0}; q2_failed=${q2_failed:-0}
+error_n=${error_n:-0}; manual_open_n=${manual_open_n:-0}
+manual_signed_n=${manual_signed_n:-0}; nocheck_n=${nocheck_n:-0}
+suspicious_n=${suspicious_n:-0}
+
+# ------------------------------------------------------------ palette ------
+# See the header comment: this is this CR's own inline description, turned
+# into concrete values, plus delta/bin/verify's actual C_PASS/C_FAIL/C_DIM
+# scheme. One place; change it here if a real shared palette ever exists.
+BG='#1b1613'; BG_PANEL='#221c18'; RULE='#4a4038'
+FG='#e9e1d6'; FG_DIM='#9a8f83'
+ACCENT='#c9714f'
+PASS='#7fb069'; FAIL='#d9634f'
+MONO="ui-monospace,'SF Mono',SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace"
+
+esc() {  # minimal HTML-escape for text interpolated into the page
+    printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+# --------------------------------------------------------------- head ------
+{
+cat <<CSS
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>delta report — $(esc "$repo_name")</title>
+<style>
+  :root {
+    --bg: $BG; --bg-panel: $BG_PANEL; --rule: $RULE;
+    --fg: $FG; --fg-dim: $FG_DIM; --accent: $ACCENT;
+    --pass: $PASS; --fail: $FAIL;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    background: var(--bg); color: var(--fg);
+    font-family: $MONO;
+    font-size: 15px; line-height: 1.55;
+    margin: 0; padding: 0;
+  }
+  body { padding: 2.5rem 1.25rem 4rem; }
+  main { max-width: 860px; margin: 0 auto; }
+  h1, h2, h3 { font-weight: 600; }
+  h1 { font-size: 1.05rem; margin: 0; }
+  h2 { font-size: 0.95rem; margin: 2.75rem 0 0.9rem; color: var(--fg); }
+  h2 .qn { color: var(--accent); }
+  a { color: var(--accent); }
+  .rule { color: var(--rule); white-space: pre; }
+  header { margin-bottom: 0.25rem; }
+  .delta { color: var(--accent); font-size: 1.3rem; }
+  .meta { color: var(--fg-dim); font-size: 0.85rem; margin: 0.6rem 0 0; }
+  .panel {
+    background: var(--bg-panel); border: 1px solid var(--rule);
+    border-radius: 3px; padding: 1.1rem 1.25rem; margin-bottom: 1rem;
+  }
+  .stat-row { display: flex; flex-wrap: wrap; gap: 1.5rem; align-items: baseline; }
+  .stat { min-width: 140px; }
+  .stat .n { font-size: 1.9rem; color: var(--fg); }
+  .stat .n.pass { color: var(--pass); }
+  .stat .n.fail { color: var(--fail); }
+  .stat .n.accent { color: var(--accent); }
+  .stat .label { display: block; color: var(--fg-dim); font-size: 0.8rem; margin-top: 0.15rem; }
+  .pass { color: var(--pass); }
+  .fail { color: var(--fail); }
+  .note { color: var(--fg-dim); font-size: 0.88rem; }
+  .too-short { color: var(--fg-dim); font-size: 0.88rem; font-style: italic; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.88rem; }
+  td, th { text-align: left; padding: 0.3rem 0.6rem 0.3rem 0; vertical-align: top; }
+  th { color: var(--fg-dim); font-weight: 600; border-bottom: 1px solid var(--rule); }
+  tr + tr td { border-top: 1px solid var(--rule); }
+  .bar-auto { fill: var(--fg); }
+  .bar-manual { fill: var(--fg-dim); }
+  .bar-day { fill: var(--fg-dim); }
+  .bar-fail { fill: var(--fail); }
+  .legend { color: var(--fg-dim); font-size: 0.8rem; margin-top: 0.4rem; }
+  .legend .sw { display: inline-block; width: 0.7em; height: 0.7em; border-radius: 1px; margin: 0 0.3em 0 1em; }
+  .legend .sw:first-child { margin-left: 0; }
+  /* Matches delta/bin/verify's own status colours exactly: manual/pending is
+     dim (C_DIM), error is the same red as an ordinary failure (C_FAIL) -
+     verify does not distinguish them by colour either, only by count and
+     label. "auto" here (Q3's "compiled to a check") is not a CLI status at
+     all, so it gets the plain foreground rather than inventing a new hue. */
+  .sw.auto { background: var(--fg); }
+  .sw.manual { background: var(--fg-dim); }
+  .sw.error { background: var(--fail); }
+  .neutral { color: var(--fg); }
+  footer { margin-top: 3rem; color: var(--fg-dim); font-size: 0.78rem; }
+</style>
+</head>
+<body>
+<main>
+CSS
+} > "$OUT"
+
+{
+cat <<HEADER
+<header>
+  <div class="rule">  Δ ─────────────────────────────────────────  <span class="delta">delta report</span></div>
+  <p class="meta">$(esc "$repo_name") &middot; generated $generated_utc &middot; $total_runs runs across $total_changes changes</p>
+</header>
+HEADER
+} >> "$OUT"
+
+# ------------------------------------------------------- empty state -------
+if [ "$total_runs" -eq 0 ]; then
+    {
+cat <<EMPTY
+<div class="panel">
+  <p>No <code>run/</code> data yet — nothing has been verified in this repository.</p>
+  <p class="note">Run <code>delta/bin/verify</code> after your next <code>apply</code> to start
+  collecting history. This page fills in from what accumulates, whether or
+  not anyone opens it in the meantime.</p>
+</div>
+</main>
+</body>
+</html>
+EMPTY
+    } >> "$OUT"
+    printf 'report: wrote %s (no run data yet)\n' "$OUT"
+    exit 0
+fi
+
+# ------------------------------------------------------------- Q1 ----------
+archived_changes=$(awk -F'\t' '$2 == 1' "$TMP/changes.tsv" | wc -l | tr -d ' ')
+n_days=$(wc -l < "$TMP/day_counts.tsv" | tr -d ' ')
+
+{
+printf '<h2><span class="qn">1.</span> Is delta being used?</h2>\n'
+printf '<div class="panel">\n'
+printf '<div class="stat-row">\n'
+printf '  <div class="stat"><span class="n accent">%s</span><span class="label">changes started</span></div>\n' "$total_changes"
+printf '  <div class="stat"><span class="n pass">%s</span><span class="label">changes archived</span></div>\n' "$archived_changes"
+printf '  <div class="stat"><span class="n">%s</span><span class="label">verify runs recorded</span></div>\n' "$total_runs"
+printf '</div>\n'
+
+if [ "$total_runs" -lt "$MIN_RUNS" ]; then
+    printf '<p class="too-short">Not enough history yet to chart a trend (%s run(s); %s minimum). This number is still real, just not a trend.</p>\n' "$total_runs" "$MIN_RUNS"
+else
+    max=$(cut -f2 "$TMP/day_counts.tsv" | sort -n | tail -1)
+    [ -n "$max" ] && [ "$max" -gt 0 ] || max=1
+    bw=$((760 / (n_days > 0 ? n_days : 1)))
+    [ "$bw" -gt 34 ] && bw=34
+    [ "$bw" -lt 4 ] && bw=4
+    gap=2
+    svgw=$(( (bw + gap) * n_days + 8 ))
+    svgh=80
+    printf '<svg viewBox="0 0 %s %s" width="100%%" height="%s" role="img" aria-label="verify runs per day">\n' "$svgw" "$svgh" "$svgh"
+    awk -F'\t' -v bw="$bw" -v gap="$gap" -v max="$max" -v h="$svgh" '
+        {
+            x = (NR - 1) * (bw + gap) + 4
+            barh = (h - 16) * ($2 / max)
+            if (barh < 2) barh = 2
+            y = h - 14 - barh
+            printf "  <rect class=\"bar-day\" x=\"%d\" y=\"%.1f\" width=\"%d\" height=\"%.1f\" rx=\"1\"><title>%s: %d run(s)</title></rect>\n", x, y, bw, barh, $1, $2
+        }
+    ' "$TMP/day_counts.tsv"
+    printf '</svg>\n'
+    printf '<p class="legend">%s day(s) with activity, oldest to newest. Bars are sparse by design — gaps are days with no runs, not zero-filled.</p>\n' "$n_days"
+fi
+printf '</div>\n'
+} >> "$OUT"
+
+# ------------------------------------------------------------- Q2 ----------
+q2_total=$((q2_passed + q2_failed))
+if [ "$q2_total" -gt 0 ]; then
+    fail_pct=$(awk -v f="$q2_failed" -v t="$q2_total" 'BEGIN { printf "%.0f", (f / t) * 100 }')
+else
+    fail_pct=0
+fi
+manual_total=$((manual_open_n + manual_signed_n))
+
+{
+printf '<h2><span class="qn">2.</span> Does verification catch anything?</h2>\n'
+printf '<div class="panel">\n'
+if [ "$q2_total" -eq 0 ]; then
+    printf '<p class="note">No ordinary (non-MANUAL) checks have run yet — nothing to report.</p>\n'
+else
+    printf '<div class="stat-row">\n'
+    printf '  <div class="stat"><span class="n fail">%s%%</span><span class="label">checks failed on verify (%s of %s)</span></div>\n' \
+        "$fail_pct" "$q2_failed" "$q2_total"
+    printf '</div>\n'
+    printf '<p class="note">This is a criterion that did not hold when checked — direct evidence for the\n'
+    printf 'claim delta is built on, not an assertion of it. It only exists because\n'
+    printf 'someone ran <code>verify</code> instead of trusting a completion claim.</p>\n'
+fi
+printf '<p class="legend">Counted separately, never folded into the number above:\n'
+printf '  <span class="sw manual"></span>%s MANUAL (not automatable — never a failure)\n' "$manual_total"
+printf '  <span class="sw error"></span>%s error (could not run at all — bad interpreter, missing exec bit, missing tool)\n' "$error_n"
+printf '</p>\n'
+printf '</div>\n'
+} >> "$OUT"
+
+# ------------------------------------------------------------- Q3 ----------
+n_change_rows=$(wc -l < "$TMP/change_manual_ratio.tsv" | tr -d ' ')
+
+{
+printf '<h2><span class="qn">3.</span> How testable are our specs?</h2>\n'
+printf '<div class="panel">\n'
+if [ "$n_change_rows" -eq 0 ]; then
+    printf '<p class="note">No change has a bound criterion yet — nothing to report.</p>\n'
+else
+    printf '<svg viewBox="0 0 640 %s" width="100%%" height="%s" role="img" aria-label="checks versus MANUAL criteria per change">\n' \
+        "$((n_change_rows * 22 + 6))" "$((n_change_rows * 22 + 6))"
+    awk -F'\t' -v OFS='\t' '
+        {
+            ch = $1; a = $2 + 0; m = $3 + 0
+            t = a + m
+            if (t == 0) t = 1
+            y = (NR - 1) * 22 + 2
+            aw = 380 * (a / t)
+            mw = 380 * (m / t)
+            label = ch
+            if (length(label) > 28) label = substr(label, 1, 27) "\xe2\x80\xa6"
+            printf "  <text x=\"0\" y=\"%d\" fill=\"#9a8f83\" font-size=\"11\">%s</text>\n", y + 10, label
+            printf "  <rect class=\"bar-auto\" x=\"260\" y=\"%d\" width=\"%.1f\" height=\"14\"><title>%s: %d check(s)</title></rect>\n", y, aw, ch, a
+            printf "  <rect class=\"bar-manual\" x=\"%.1f\" y=\"%d\" width=\"%.1f\" height=\"14\"><title>%s: %d MANUAL</title></rect>\n", 260 + aw, y, mw, ch, m
+        }
+    ' "$TMP/change_manual_ratio.tsv"
+    printf '</svg>\n'
+    printf '<p class="legend"><span class="sw auto"></span>compiled to a check<span class="sw manual"></span>MANUAL — oldest change first.</p>\n'
+    if [ "$n_change_rows" -lt "$MIN_RUNS" ]; then
+        printf '<p class="too-short">Only %s change(s) so far — not enough to call this a trend yet.</p>\n' "$n_change_rows"
+    fi
+fi
+printf '</div>\n'
+} >> "$OUT"
+
+# ------------------------------------------------------------- Q4 ----------
+n_fail_rows=$(wc -l < "$TMP/criterion_fail_counts.tsv" | tr -d ' ')
+n_repro_rows=$(wc -l < "$TMP/criterion_repro_counts.tsv" | tr -d ' ')
+
+{
+printf '<h2><span class="qn">4.</span> What keeps breaking?</h2>\n'
+printf '<div class="panel">\n'
+
+printf '<p class="note">Criteria that failed on more than one run — either a flaky check or a\n'
+printf 'genuinely fragile area:</p>\n'
+if [ "$n_fail_rows" -eq 0 ]; then
+    printf '<p class="note">Nothing has failed more than once. Either good, or too little history yet.</p>\n'
+else
+    printf '<table><tr><th>change</th><th>criterion</th><th>failures</th></tr>\n'
+    while IFS='	' read -r ch crit n; do
+        printf '<tr><td>%s</td><td>%s</td><td class="fail">%s</td></tr>\n' "$(esc "$ch")" "$(esc "$crit")" "$n"
+    done < "$TMP/criterion_fail_counts.tsv"
+    printf '</table>\n'
+fi
+
+printf '<p class="note" style="margin-top:1.1rem">Reproductions that took more than one attempt to turn green:</p>\n'
+if [ "$n_repro_rows" -eq 0 ]; then
+    printf '<p class="note">No reproduction has needed more than one attempt so far.</p>\n'
+else
+    printf '<table><tr><th>change</th><th>criterion</th><th>attempts</th><th>status</th></tr>\n'
+    while IFS='	' read -r ch crit n fx; do
+        if [ "$fx" = 1 ]; then st='fixed'; stcls='pass'; else st='still open'; stcls='neutral'; fi
+        printf '<tr><td>%s</td><td>%s</td><td>%s</td><td class="%s">%s</td></tr>\n' \
+            "$(esc "$ch")" "$(esc "$crit")" "$n" "$stcls" "$st"
+    done < "$TMP/criterion_repro_counts.tsv"
+    printf '</table>\n'
+fi
+printf '</div>\n'
+} >> "$OUT"
+
+{
+printf '<footer>\n'
+printf '  Δ ────── generated by delta/bin/report &middot; aggregate only, no author or per-developer data\n'
+printf '</footer>\n'
+printf '</main>\n</body>\n</html>\n'
+} >> "$OUT"
+
+printf 'report: wrote %s\n' "$OUT"
