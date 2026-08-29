@@ -9,6 +9,47 @@ file). Every other entry documents delta itself; `CR-DOCS` entries document
 a documentation pass, not a code change, so they carry no behaviour-change
 line.
 
+## CR-008 — A second pair of eyes (2026-08-29)
+
+A sixth command, `critique`, deliberately restricted to reading only
+`delta/changes/<id>/spec.md` and `delta/constitution.md` — never the
+exploration findings, never the code, never the original conversation. It
+looks for unmeasurable criteria, checks that would pass while the feature
+stays broken, missing failure modes, unstated assumptions, conflicts with
+the constitution, and MANUAL criteria that could be automated, then writes
+findings (or `No findings.`) to `delta/changes/<id>/critique.md` — never an
+edit to spec.md. `propose` now runs it automatically once the developer
+approves and files are written, and presents its findings before propose's
+own closing frame; it also stays independently re-runnable standalone, same
+as every other command. New `roles` field in `delta/adapters.yaml` documents
+where a tool can spawn an isolated sub-context: declared for `claude` (the
+Task tool, directly verified — this is the mechanism this repository's own
+agent runs on) and, with a secondary-source caveat, `antigravity`;
+deliberately left undeclared for `gemini` (no such mechanism exists) and
+`codex` (a mechanism exists but current reports describe spawn-by-name as
+unreliable). Where `roles` is declared, critique and explore's new optional
+parallel fan-out (one sub-context per independent call chain) use a real
+isolated subagent; where it isn't, both fall back to a fully-specified
+sequential path that is never a degraded stub. A real Task-tool subagent run
+against `information-graphics`' actual spec, with zero access to this
+conversation, produced nine specific findings grounded in that spec's own
+text and correctly reported the unfilled constitution template rather than
+fabricating a conflict — evidence lives in
+`delta/changes/second-pair-of-eyes/dogfood/`. Adding a sixth command exposed
+two `docs-reconciliation` checks that had hardcoded "five commands" and a
+literal 20-file count rather than deriving them; fixed in this change so
+they don't go red the moment it lands.
+
+behaviour change: yes — `propose` now runs an additional step
+(`critique`) after file-write and before its closing frame on every use,
+which existing users did not have before; nothing about it blocks or gates
+`verify`/`archive`, and its output is additive (`critique.md`, never a
+change to `spec.md`). `docs-reconciliation`'s C1 and C3 checks now derive
+their expected command list/file count from `delta/commands/*.md` instead
+of a hardcoded five/twenty, so their pass/fail condition changes for any
+repo state with a different command count — correct behaviour, but a change
+from the previous fixed expectation.
+
 ## CR-007 — Efficient reading (2026-08-29)
 
 Pure prompt work — no `delta/bin/*` change. `explore` now reads

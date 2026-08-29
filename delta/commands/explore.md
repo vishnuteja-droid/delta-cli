@@ -143,6 +143,26 @@ Entry point, call chain, data touched, unknowns — when all four are
 established, stop. There is always more code to read; that is exactly why
 an explicit stopping point matters more than a thorough one.
 
+## Parallel exploration, where roles exist (CR-008)
+
+If `delta/adapters.yaml` declares a `roles` mechanism for this tool (see its
+own field docs), and this area has more than one genuinely independent entry
+point — call chains that do not share the files they touch — you may fan
+out: one sub-context per chain, each given only that chain's starting point,
+findings merged back into a single file afterward. This is where exploration
+gets expensive and where a single context degrades as it fills, so it is
+worth doing when the area actually has that shape.
+
+Optional, always. Sequential is the reference implementation and is always
+correct — this is something to reach for on a large area, never something
+required for a small one. A parallel run has to produce the same findings a
+sequential run would have: same four sections, same content, no chain
+skipped because it ran in a different sub-context. Merging is concatenation
+with duplicate `Data touched` entries folded together, not a shortcut that
+changes what gets found. If the chains are not actually independent — they
+converge on the same files — do not fan out; the merge step would cost more
+than the parallelism saves.
+
 ## Draw the call chain (CR-006)
 
 A diagram replaces "one line per hop" above. Boxes for data, arrows for

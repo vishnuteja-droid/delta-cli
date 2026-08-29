@@ -3,7 +3,7 @@
 ## Changing this system
 
 Changes to existing behaviour go through delta, a spec lifecycle that lives in
-`delta/`. The five commands install once per machine (`delta/bin/install`);
+`delta/`. The commands install once per machine (`delta/bin/install`);
 `delta/` itself is created lazily, by `propose`, the first time it runs here —
 there is no separate init step. `delta/bin/verify` and `delta/bin/palette.sh`
 are committed in this repo; if either is missing, copy both in from a repo
@@ -15,10 +15,13 @@ anywhere to fall back on, and `verify` will not start without `palette.sh`.
 2. **propose** — write `spec.md` as a delta against `delta/truth/` using
    ADDED / MODIFIED / REMOVED / RENAMED, plus one executable check per
    acceptance criterion in `checks/`. Both need human approval before landing.
-3. **apply** — implement the spec in order. Never edit a check to match the
+3. **critique** — runs automatically once `propose` writes to disk: a second
+   opinion reading only the spec and the constitution, never the exploration
+   or the code. Findings, never edits; nothing blocks on them.
+4. **apply** — implement the spec in order. Never edit a check to match the
    implementation.
-4. **verify** — run `delta/bin/verify <change-id>`.
-5. **archive** — fold the applied delta into `delta/truth/`.
+5. **verify** — run `delta/bin/verify <change-id>`.
+6. **archive** — fold the applied delta into `delta/truth/`.
 
 `delta/constitution.md` is inherited by every change. Read it first.
 

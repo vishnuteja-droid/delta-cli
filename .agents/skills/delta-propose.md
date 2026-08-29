@@ -413,10 +413,22 @@ Head each file's block with its path as a one-line comment above the fence
 (`spec.md`, then each `checks/C<n>-*.sh` in order) so a reviewer scanning past
 the syntax highlighting still knows what they're looking at.
 
+## Once approved: write, then critique (CR-008)
+
+When the developer approves, write `spec.md` and every `checks/C<n>-*.sh` to
+disk exactly as presented — `chmod +x` each check — then run `critique`
+(see `delta/commands/critique.md`) on the change you just wrote, following
+its own instructions verbatim, including the frame-skipping rule at its top:
+present its findings here as a labelled section, not as a second pair of
+frames. Do this every time, not only when the spec seems like it might have
+gaps — that judgement is exactly what critique exists to not leave to the
+same context that wrote the spec.
+
 ## Print to the terminal
 
 The spec sections with counts, the criteria list, and the questions you need
-answered. Then the diff, rendered as above.
+answered. Then the diff, rendered as above. Once written, `critique`'s own
+findings section (or its `No findings.` line).
 
 ## Say what this cost (CR-007)
 

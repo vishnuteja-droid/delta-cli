@@ -22,8 +22,8 @@ fi
 # invariant is that no such command file or generated adapter output
 # exists - not a text search, which would false-positive on the correct
 # negations already in the docs ("no /delta:bug command", "No init command").
-if ls delta/commands/ | grep -viE '^(explore|propose|apply|verify|archive)\.md$'; then
-    echo "delta/commands/ has a file outside the five known commands"
+if ls delta/commands/ | grep -viE '^(explore|propose|critique|apply|verify|archive)\.md$'; then
+    echo "delta/commands/ has a file outside the known commands"
     fail=1
 fi
 for adapter_dir in .claude/commands .agents/skills .codex/prompts; do

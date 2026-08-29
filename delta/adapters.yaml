@@ -33,6 +33,15 @@
 #   invoke      what the user types
 #   note        anything a reader needs to know about this entry
 #   install     extra step required because the tool cannot load from the repo
+#   roles       CR-008, optional. How this tool spawns an isolated sub-context
+#               (no inherited conversation history), for commands that use one
+#               (critique; explore's optional parallel fan-out). Omitted means
+#               it can't - delta runs that step as a plain sequential
+#               invocation there instead, with an explicit instruction to
+#               disregard prior context. The sequential path always works and
+#               always produces the same output; roles only make the isolation
+#               real instead of asked-for. Never required reading for the
+#               other five commands.
 
 adapters:
   - id: claude
@@ -49,6 +58,7 @@ adapters:
     invoke: /delta-explore
     note: Docs define a command name as the file name without extension, and subdirectory namespacing has a standing bug report, so files are emitted flat with a delta- prefix rather than as delta/explore.md. User-level ~/.claude/commands/ is documented as personal, cross-project, never committed - exactly what delta/bin/install targets.
     install: none
+    roles: subagent - the Task tool, given a subagent_type (general-purpose works; no delta-specific type needed) and a prompt. Spawned mid-conversation by the orchestrating agent, not a separate command the user types. Isolated context: a subagent starts with only what its prompt hands it, none of the parent conversation. Directly verified - this is the mechanism this very session uses to spawn its own subagents.
 
   - id: gemini
     name: Gemini CLI
@@ -64,6 +74,10 @@ adapters:
     invoke: /delta:explore
     note: Subdirectories namespace with a colon, so delta/explore.toml becomes /delta:explore. Required key is prompt; description is optional and included. Docs describe both a global ~/.gemini/commands/ (all sessions) and a project .gemini/commands/ (that project only), with project taking precedence - the split this table now models for every adapter.
     install: none
+    # roles: deliberately omitted (CR-008). Gemini CLI has no isolated
+    # sub-context mechanism - critique and explore's parallel fan-out both
+    # run as plain sequential invocations here, which is the fully-supported
+    # path, not a degraded one.
 
   - id: antigravity
     name: Antigravity CLI
@@ -80,6 +94,7 @@ adapters:
     note: Workspace skills live in .agents/skills and stay with the repository. A project still carrying .gemini/skills should rename that folder to .agents/skills.
     user_dir_verified: single secondary source (no official doc reachable from this environment's egress proxy); confirm against Antigravity's own docs before relying on it. If wrong, this is a one-line fix in this table.
     install: none
+    roles: subagent - the orchestrator decomposes a goal and spawns subagents with isolated context windows (no inherited conversation history) automatically; no single fixed command found for asking by name. Single secondary source (same egress restriction as user_dir_verified above, no official antigravity.google doc reachable from this environment) - confirm before relying on it for anything load-bearing.
 
   - id: codex
     name: Codex
@@ -95,3 +110,12 @@ adapters:
     invoke: /delta-explore
     note: Codex loads prompts from $CODEX_HOME/prompts only - project-scoped .codex/prompts is an open feature request, not shipped. That makes user_dir the ONLY location that has ever worked for Codex; dir/project-level output is emitted anyway so it is versioned and ready if project-scoped loading lands, but delta/bin/install writing to user_dir is what actually makes /delta-explore appear in Codex today. Codex reads AGENTS.md from the repo natively regardless.
     install: none
+    # roles: investigated for CR-008, deliberately left undeclared. Codex does
+    # have custom subagents (TOML files under .codex/agents/) with isolated
+    # context, but current reports (including open upstream issues) describe
+    # spawning a specific agent by name as unreliable - the interface accepts
+    # a type/prompt override but not "spawn the one defined in <file>.toml"
+    # cleanly yet. Declaring roles here would assert an isolation guarantee
+    # this table cannot currently stand behind; the sequential fallback is
+    # correct and fully supported, so that is what Codex gets until this is
+    # re-verified against Codex's own docs.

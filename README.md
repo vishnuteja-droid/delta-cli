@@ -2,15 +2,13 @@
 
 A spec-driven lifecycle for changing systems that already exist: understand
 the code before proposing a change, then prove it worked by running
-something, not by asking a model whether it looks right. Five commands:
-**explore** reads the code, **propose** writes a spec plus one check per
-acceptance criterion, **apply** implements it, **verify** runs the checks,
-**archive** folds the result into truth — the next change diffs against what
-`archive` recorded, not against history.
-
-No binary, no compile step, no Python, no Node, no package manager — the
-runner is POSIX `sh`. **Windows needs Git Bash** (bundled with Git for
-Windows, and unlike WSL it shares the Windows filesystem).
+something, not by asking a model whether it looks right. **explore** reads
+the code, **propose** writes a spec plus one check per criterion,
+**critique** reviews it independently, **apply** implements it, **verify**
+runs the checks, **archive** folds the result into truth — the next change
+diffs against what `archive` recorded, not against history. No binary, no
+compile step, no Python, no Node — the runner is POSIX `sh`. **Windows needs
+Git Bash** (bundled with Git for Windows; unlike WSL it shares the filesystem).
 
 ## Install
 
@@ -18,32 +16,30 @@ Windows, and unlike WSL it shares the Windows filesystem).
 delta/bin/install
 ```
 
-Writes the five command files into every supported CLI's personal command
-directory once per machine, not once per repo. Copies files already in this
-checkout; no network fetch, nothing else installed. Safe to re-run any time;
-`rm -rf` those directories to uninstall. From then on, `/delta-explore` works
-in **any** repository on this machine, including one that has never seen delta.
+Writes the command files into every supported CLI's personal command
+directory once per machine, not once per repo — no network fetch, nothing
+else installed. Safe to re-run any time; `rm -rf` those directories to
+uninstall. `/delta-explore` then works in **any** repository on this machine.
 
-`delta/bin/verify` is deliberately **not** part of what `install` writes: it
-is committed inside each repository — the only copy that ever exists, nothing
-tracks a version of it. A repo gets it the way it gets any other file: copied
-in from a repo that already has delta. See [Lazy per-repo
-data](#lazy-per-repo-data).
+`delta/bin/verify` is deliberately **not** part of what `install` writes: a
+committed file, the only copy that ever exists, copied in from a repo that
+already has delta. See [Lazy per-repo data](#lazy-per-repo-data).
 
-## Five commands
+## Six commands
 
 | command | what it does |
 |---|---|
 | `explore <area>` | Read the affected code. Write entry points, call chain, data touched, and what could not be determined. |
-| `propose <intent>` | A spec against current truth — ADDED / MODIFIED / REMOVED / RENAMED — plus one check per criterion. Presented as a diff; nothing lands unapproved. |
+| `propose <intent>` | A spec against current truth — ADDED / MODIFIED / REMOVED / RENAMED — plus one check per criterion. Presented as a diff; nothing lands unapproved. Runs `critique` once written. |
+| `critique [id]` | A second opinion on a spec, reading only the spec and the constitution — no exploration, no code. Findings, never edits. |
 | `apply` | Implement the spec in order, marking progress. |
 | `verify` | Run `delta/bin/verify`. No model involvement. |
 | `archive` | Fold the applied delta into truth. |
 
 ## A check is an executable file
 
-Not a description, not a YAML entry — a shebang file that exits 0 or non-zero,
-bound to a criterion by filename prefix (`checks/C3-*` serves `C3`):
+A shebang file that exits 0 or non-zero, bound to a criterion by filename
+prefix (`checks/C3-*` serves `C3`):
 
 ```sh
 #!/bin/sh
@@ -52,10 +48,9 @@ curl -sf -X POST localhost:8081/webhook/retry -d @fixtures/dup.json > /dev/null
 test "$(psql -tAc "select count(*) from ledger_entry where provider_ref='X1'")" = "1"
 ```
 
-Most checks are thin wrappers over existing tests. `chmod +x` it the moment
-you write it (write-a-file tools leave the bit off); without it a check
-reports as [`error`](#running-verify). `.gitattributes` forces LF on
-`delta/bin/**` and `**/checks/**` — a `\r`-terminated shebang isn't one.
+`chmod +x` it the moment you write it; without it a check reports as
+[`error`](#running-verify). `.gitattributes` forces LF on `delta/bin/**`
+and `**/checks/**` — a `\r`-terminated shebang isn't one.
 
 ## Running verify
 
@@ -81,8 +76,8 @@ a log per criterion, `results.tsv`, `meta.txt`, `summary.txt`.
 
 ## MANUAL criteria
 
-Real, unautomatable criteria are marked `MANUAL`. `verify` never
-auto-passes one; it needs a sign-off line in `run/signoff.md`:
+Real, unautomatable criteria are marked `MANUAL` — never auto-passed; a
+sign-off line in `run/signoff.md` is required:
 
 ```
 C4 signed-off-by: alex 2026-08-26 - read all three, each names the next action
@@ -100,9 +95,21 @@ expected to fail before the fix lands:
 - `fixed` (exit 0) — passes, having reproduced earlier; flips permanently
 - `suspicious` (exit 6) — passes without ever having reproduced; the repro is wrong
 
-The flip is recorded in `run/reproductions.md`, tracked in git so it
-survives a clone. `archive`'s `--archive-gate` exits 5 while a reproduction
-is outstanding. No `/delta:bug` command — one extra check state, same lifecycle.
+The flip is recorded in `run/reproductions.md`, tracked in git. `archive`'s
+`--archive-gate` exits 5 while a reproduction is outstanding. No `/delta:bug`
+command — one extra check state, same lifecycle.
+
+## A second pair of eyes
+
+`critique` reads only the spec and the constitution — never the exploration,
+the intent, or the code, so it has to ask whether the spec stands on its own
+rather than agreeing with reasoning it never saw. Looks for unmeasurable
+criteria, a check that would pass while the feature is broken, missing
+failure modes, conflicts, and MANUAL criteria that could be automated —
+findings only, to `critique.md`, never edits, honest when it finds nothing.
+Where an adapter declares `roles`, it runs in an isolated subagent; where
+not, sequentially with an instruction to disregard prior context. Nothing
+blocks on findings; they're recorded.
 
 ## Layout
 
@@ -139,24 +146,21 @@ No `init` command. The first time `propose` runs in a repository — root found
 by walking up for `delta/`, then `.git`, honouring `$DELTA_ROOT` — it creates
 `delta/{truth,changes,bin}` and writes `delta/constitution.md` from the
 template. It does not create `delta/bin/verify`: no global copy to pull
-from, so it says to copy `delta/bin/verify` **and** `delta/bin/palette.sh`
-in — verify sources palette.sh unconditionally, so one without the other
-fails to start (`delta/bin/stage-rail` is optional: without it, verify runs
-fine, just without the lifecycle rail). A teammate cloning a repo with
-`delta/` already needs none of this.
+from, so it says to copy `delta/bin/verify` **and** `delta/bin/palette.sh` in
+(`stage-rail` is optional — verify runs fine without it, just no rail). A
+teammate cloning a repo with `delta/` already needs none of this.
 
 ## The constitution
 
-One hand-written file, under 60 lines, non-negotiables only, inherited by
-every change. `propose` writes the template verbatim the first time it runs
-— no generator introspects the codebase. Replace it before the first real
-change lands.
+One hand-written file, under 60 lines, non-negotiables only, written verbatim
+by `propose`'s template the first time it runs — no generator introspects
+the codebase. Replace it before the first real change lands.
 
 ## Working with any CLI
 
 `delta/commands/` holds one canonical file per command; `delta/adapters.yaml`
-describes each target's format; `delta/bin/generate-commands` emits the
-per-tool files. Adding a CLI is a table entry, never a code change.
+describes each target's format and emits via `delta/bin/generate-commands`.
+Adding a CLI is a table entry, never a code change.
 
 | tool | directory | format | invoked as |
 |---|---|---|---|
@@ -165,23 +169,19 @@ per-tool files. Adding a CLI is a table entry, never a code change.
 | Antigravity CLI | `.agents/skills/` | markdown + front matter | `/delta-explore` |
 | Codex | `.codex/prompts/` | markdown + front matter | `/delta-explore` |
 
-[`AGENTS.md`](AGENTS.md) is the durable, vendor-neutral target the per-CLI
-files layer over; delta builds no forge integration.
+[`AGENTS.md`](AGENTS.md) is the durable, vendor-neutral target these layer over.
 
 ## Terminal presentation and the telemetry report
 
-`verify` prints its own frame, streams results, and degrades honestly: no
-colour off a TTY or `NO_COLOR`, ASCII glyphs off UTF-8, truncation not
-wrapping. Every command opens with `delta/bin/stage-rail`'s lifecycle
-position (a failed stage stays red until resolved); `verify` alone draws a
-brief, interruptible startup reveal, once per session. Colours/glyphs live
-in `delta/bin/palette.sh`. `explore` draws the call chain as a diagram plus
-a Mermaid file beside it.
-
-`verify --all` is a read-only dashboard: every change's criteria with an
-eight-run sparkline, no checks executed. `delta/bin/report` writes
-`delta/report.html`: usage, failure rate, testability, recurring failures
-as a heatmap — aggregate only, no per-developer data, no server, no JS.
+`verify` prints its own frame, streams results, degrades honestly (no colour
+off a TTY, ASCII off UTF-8), and opens with `delta/bin/stage-rail`'s
+lifecycle position — a failed stage stays red until resolved. Colours/glyphs
+live in `delta/bin/palette.sh`. `explore` draws the call chain as a diagram
+plus a Mermaid file. `verify --all` is a read-only dashboard: every
+criterion's last eight runs as a sparkline, no checks executed.
+`delta/bin/report` writes `delta/report.html` — usage, failure rate,
+testability, recurring failures as a heatmap — aggregate only, no
+per-developer data, no server, no JS.
 
 ## Verifying delta itself
 
@@ -194,6 +194,6 @@ delta/bin/verify example-verify-exit-codes
 
 ## Deliberately not built
 
-A live workflow UI — a static page can't carry buttons or stream a run.
-Also deferred: a code graph, an MCP server, multi-agent roles, sixel/image
-terminal graphics, any networked component.
+A live workflow UI. Also deferred: a code graph, an MCP server, agent
+personas (PM/architect/reviewer role-play — unrelated to `adapters.yaml`'s
+`roles`), sixel/image graphics, networking.

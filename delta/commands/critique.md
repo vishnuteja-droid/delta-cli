@@ -1,0 +1,138 @@
+---
+description: A restricted-context review pass over a proposed spec - reads only the spec and the constitution, produces findings, never edits.
+argument-hint: "[change-id]"
+---
+
+## Signature frame — print this first, unless invoked automatically
+
+If a person invoked this command directly, the very first line of your
+response is the opening frame. Nothing precedes it.
+
+      Δ ─────────────────────────────────  delta critique
+
+Exact characters: `Δ` (U+0394), `─` (U+2500), `·` (U+00B7). Two leading spaces,
+`Δ`, one space, the rule, two spaces, the label. Pad the rule so the line is
+about 60 characters wide. If the terminal is not UTF-8, substitute `d` for `Δ`,
+`-` for `─`, and `-` for `·`.
+
+**If `propose` invoked this automatically** (see its own instructions), skip
+both frames entirely. `propose`'s own closing frame is the true last line of
+that response; a second pair of frames inside it would contradict "print this
+last" for both commands. Print the findings themselves (see below) as a
+labelled section in that same response instead.
+
+## Where this repository's delta/ lives
+
+Resolve the root the way git resolves its own, before doing anything else:
+
+1. If `$DELTA_ROOT` is set, use it without searching.
+2. Otherwise check the current directory, then each parent in turn, for a
+   `delta/` directory. The first one found is the root.
+3. If none is found anywhere above you, stop: there is no `delta/` here yet.
+   Say so and point at `/delta:propose`.
+
+If the resolved root is not the current directory, say so before doing
+anything else: `root: /path/to/repo`. Every `delta/...` path below is
+relative to that root, not to the current directory.
+
+## What you are doing
+
+Change: $ARGUMENTS — if empty, use the most recently modified directory under
+`delta/changes/`.
+
+A second pair of eyes on `delta/changes/<id>/spec.md`, deliberately
+restricted so it cannot just agree with whoever wrote the spec.
+
+## The restriction is the entire mechanism
+
+**Read exactly two files: `delta/changes/<id>/spec.md` and
+`delta/constitution.md`.**
+
+Do not read:
+
+- `delta/changes/<id>/explore.md` — the exploration findings
+- the original intent that `propose` was given
+- the code the spec describes, or any other source file
+
+This is not a suggestion to skim past them. It is the whole point. Given the
+exploration, a reviewer reconstructs the author's reasoning and agrees with
+it — that is what self-review already does, and it is not this command's job
+to do it again. Given only the spec, you have to ask whether the spec stands
+on its own: exactly the position of the person who reads it next week, or the
+agent that implements it, neither of whom has your exploration either.
+
+**If a subagent role is declared** for this tool in `delta/adapters.yaml`
+(see its `roles` field), spawn one now — the mechanism it describes — with
+instructions to read only those two files and apply everything below, then
+return its findings. Isolation is then structural: the subagent's context
+never had the exploration or the code in it to begin with.
+
+**If no role is declared**, continue in this same conversation, but as a
+genuinely separate pass: if you have already read `explore.md`, the original
+intent, or the code earlier in this conversation, this pass has to proceed
+as though you have not. Do not consult what you already concluded from them.
+Re-derive every finding from the spec and the constitution alone, the way a
+fresh reader would have to. This is weaker than real isolation and it is
+worth naming that plainly if a finding feels uncertain — but it is the
+portable fallback every tool without subagents gets, and it is not optional
+just because it is imperfect.
+
+## What to look for
+
+- **Criteria that cannot be measured.** An observable outcome, or it is not
+  a criterion — the same bar `propose` is supposed to hold itself to.
+- **A criterion whose check would pass while the feature is broken.** The
+  check that says nothing, the assertion one level too shallow, the test
+  that exercises the wrong path.
+- **Missing failure modes.** What happens when the thing being added fails,
+  and does any criterion say so?
+- **Unstated assumptions about existing behaviour.** A criterion that only
+  holds if some other part of the system behaves a particular way the spec
+  never says it relies on.
+- **Conflicts between criteria.** Two criteria that cannot both be true at
+  once, or that quietly contradict the constitution.
+- **A MANUAL criterion that could in fact be automated.** MANUAL is for
+  criteria that genuinely cannot be checked, not for ones nobody tried to
+  automate. Every MANUAL you can turn into a check is a direct improvement
+  to the number `delta/bin/report`'s second question tracks.
+
+## Findings, not edits
+
+Never change `spec.md` or anything under `checks/`. You are producing a
+second opinion, not a rewrite — the developer decides what to act on, the
+same way they decide what to approve in `propose`'s own diff.
+
+Write findings to `delta/changes/<id>/critique.md`. One entry per finding,
+each naming which criterion it is about and which category above it falls
+under. If a category found nothing, do not force an entry into it — say
+nothing there rather than manufacturing an objection to look thorough.
+
+**If there is nothing to report at all, say so explicitly** — a short
+`No findings.` plus which categories you actually checked. An empty-looking
+critique that skipped the work and a genuinely clean spec must not read the
+same; the second one earns the sentence that says so.
+
+## Print to the terminal
+
+Print each finding as you establish it, not batched at the end — same
+discipline `explore` uses, for the same reason.
+
+     reading   spec.md
+     reading   constitution.md
+     finding   C3: check asserts a 200 status, not that the row is unique
+     finding   C5 MANUAL: "clear error message" - a string-contains check would cover this
+
+Two kinds of line: `reading` (transient, which of the two files) and
+`finding` (kept, one per line). If there is nothing to report, print
+`no findings` in place of the finding lines, not silence.
+
+## Signature frame — print this last, unless invoked automatically
+
+The final line of your response, after everything else — only when this
+command was invoked directly, not automatically by `propose`:
+
+      Δ ──────────────  3 findings · 2 categories clear
+
+Same characters and padding rules as the opening frame. Counts must be real:
+findings written, and how many of the six categories above turned up
+nothing. Never write "done" and never invent an elapsed time.
