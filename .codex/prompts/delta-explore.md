@@ -54,6 +54,12 @@ nothing to write into: print the same findings to the terminal in full and
 stop there. Do not create `delta/` to make a place to put them — that is
 `propose`'s decision to make, not this command's.
 
+**Write incrementally (CR-007).** Append to the findings file as each piece
+is established — an entry point the moment you confirm it, the call chain as
+you trace it, an unknown the moment it becomes one — not composed once at
+the end. A run that gets interrupted, hits a budget, or hits a context limit
+should leave a partial file with what was actually established, not nothing.
+
 ### Lifecycle rail — print this next (CR-006)
 
 As soon as `<id>` is known (an existing change directory, or the slug this
@@ -72,13 +78,56 @@ This is the step that makes the following `propose` worth trusting. A findings
 file that restates what the code obviously says has failed, even if everything
 in it is true.
 
-## Read first
+## Read truth first (CR-007)
 
-Read `delta/constitution.md` if it exists at the resolved root. Read
-`delta/truth/` if it exists and is not empty — that is what is already
-understood, and you are looking for what it does not yet cover. Neither
-existing is a normal, common state for a repository that has never run
-`propose`; proceed without them.
+**The single biggest lever this tool has, and the reason `archive` exists.**
+If `delta/truth/` has a file covering this area, read it before touching
+source. Then find what might have moved since: the truth file's last commit
+(`git log -1 --format=%h -- delta/truth/<file>.md`) and whatever changed in
+this area's paths after it (`git log --oneline <that-commit>..HEAD --
+<paths>`). Investigate only what truth does not answer, plus whatever that
+diff touched — not the area again from scratch. No generic reading tool can
+do this; it is the direct payoff of the archive step, and skipping it means
+paying full price for knowledge this repository already wrote down. The
+tenth explore of a stable area should be nearly free.
+
+Where truth and the code disagree, **the code wins and truth is stale** —
+say so as its own finding (see "Print to the terminal" below), not as a
+silent correction. A stale truth entry is a signal worth surfacing on its
+own; someone should fix it during the next `archive`.
+
+If truth does not exist, or has nothing for this area, read the code as
+below — there is nothing to save time against yet. Read `delta/constitution.md`
+too, if it exists.
+
+## Bound the traversal (CR-007)
+
+Start from the named entry point and follow only its call chain — not
+neighbouring code that happens to sit nearby, not everything a touched file
+imports. A call into another service is recorded as an edge (see "Draw the
+call chain" below) and not followed into that service's own code: you are
+mapping this area's chain, not the whole system's.
+
+Skip tests, generated code, and vendored dependencies. Do not read them
+unless the intent names them directly. An unbounded read is where most of
+the cost goes, and it is also where confidently wrong findings come from —
+an agent that read forty unrelated files has forty more chances to
+hallucinate a connection that is not there.
+
+## Read cheap first (CR-007)
+
+For each thing you need to know, try the cheapest step that could answer it
+before reaching for the next one:
+
+1. grep for the symbol
+2. file headers and imports
+3. signatures
+4. bodies
+
+Descend only when the cheaper step did not answer the question. Note in the
+findings when a body had to be read (see "Say what this cost" below) — that
+is itself a signal, usually that the header or signature did not say enough,
+which is worth knowing about the code, not only about this explore.
 
 ## Find these four things
 
@@ -90,6 +139,12 @@ existing is a normal, common state for a repository that has never run
 3. **Data touched.** Tables, collections, queues, caches, external services.
    For each, whether this area reads it, writes it, or both.
 4. **Unknowns.** What you could not determine from the code, stated plainly.
+
+## Stop when you have enough (CR-007)
+
+Entry point, call chain, data touched, unknowns — when all four are
+established, stop. There is always more code to read; that is exactly why
+an explicit stopping point matters more than a thorough one.
 
 ## Draw the call chain (CR-006)
 
@@ -188,14 +243,15 @@ stalled one.
      tracing   eapi → papi
      chain    eapi → papi → sapi → ledger
      unknown  retry count comes from config
+     stale    truth says papi is synchronous - code shows an async queue
 
 Two kinds of line, and only these verbs: `reading` a file you are currently
 in, `tracing` a call chain as you follow it — both transient, a note of what
-you are doing right now, not a finding. `entry`, `chain`, `unknown` are the
-findings themselves, kept once written. Three-space indent, label column
-padded to 8, then the value. If there are more than about eight findings,
-print the entry points and the unknowns and say how many others are in the
-file.
+you are doing right now, not a finding. `entry`, `chain`, `unknown`, `stale`
+(CR-007, a truth entry the code contradicts) are the findings themselves,
+kept once written. Three-space indent, label column padded to 8, then the
+value. If there are more than about eight findings, print the entry points
+and the unknowns and say how many others are in the file.
 
 This is composed response text, not a live-updating terminal line — unlike
 `verify`, a real process with a real spinner, there is nothing here that
@@ -205,6 +261,20 @@ line once, in order, as the work happens.
 If no `delta/` exists and nothing was written, print the full findings in that
 same format instead of a condensed version of them — the terminal is the only
 copy, so print all of it, not a summary of it.
+
+## Say what this cost (CR-007)
+
+One line, directly above the closing frame:
+
+     read: 6 files · truth: used (3 answered) · bodies: 2
+
+Files opened (every file you actually opened, not files only grepped),
+whether truth answered anything and how much of it, and how many times the
+ladder had to descend to a body. `truth: none` if there was nothing to read,
+`truth: not used` if it existed but this area was not in it. This is not
+telemetry for its own sake — it is how you tell whether these instructions
+are working, and it makes an expensive explore visible instead of invisible,
+so the prompt can be fixed instead of assumed fine.
 
 ## Signature frame — print this last
 

@@ -177,6 +177,10 @@ Each criterion states an observable outcome. "The code handles retries" is not
 a criterion. "A second webhook with the same provider_ref creates no second
 ledger row" is.
 
+**Stop when you have enough (CR-007).** Once every acceptance criterion is
+measurable and either has a check or is marked MANUAL, stop writing more.
+Not when the spec *feels* complete — that bar has no edge, and this one does.
+
 ## Then write a check for each one
 
 This is the only command in the lifecycle where a model touches verification,
@@ -356,6 +360,18 @@ the syntax highlighting still knows what they're looking at.
 
 The spec sections with counts, the criteria list, and the questions you need
 answered. Then the diff, rendered as above.
+
+## Say what this cost (CR-007)
+
+One line, directly above the closing frame:
+
+     read: 4 files · truth: used (2 answered)
+
+Files opened while writing this spec — constitution, truth, explore.md, plus
+any source you had to check directly — and whether truth answered anything.
+Not telemetry for its own sake: it is how you tell whether these
+instructions are working, and it makes an expensive propose visible instead
+of invisible.
 
 ## Signature frame — print this last
 

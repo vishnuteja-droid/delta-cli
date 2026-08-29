@@ -9,6 +9,35 @@ file). Every other entry documents delta itself; `CR-DOCS` entries document
 a documentation pass, not a code change, so they carry no behaviour-change
 line.
 
+## CR-007 — Efficient reading (2026-08-29)
+
+Pure prompt work — no `delta/bin/*` change. `explore` now reads
+`delta/truth/` before source, checks `git log` since the truth file's last
+commit, and investigates only the gap; a truth entry the code contradicts
+is its own named finding ("stale"), not a silent correction. New bounded
+traversal (a call into another service is recorded as an edge, not
+followed; tests/generated/vendored code skipped unless the intent names
+them) and an explicit cheap-first reading ladder (grep, then headers/
+imports, then signatures, then bodies — noting when a body was needed).
+Explicit stop conditions for `explore` (entry point, call chain, data
+touched, unknowns) and `propose` (every criterion measurable and
+checked-or-MANUAL). `explore`'s findings file is now written incrementally,
+not composed once at the end. All four agent-executed commands
+(explore/propose/apply/archive) end with a line reporting what they read
+before the closing frame. Also archived `docs-reconciliation` into
+`delta/truth/docs.md`, ahead of this CR, so its truth-first instructions had
+real committed history to dogfood against rather than a scratch fixture —
+a genuine second explore of the "docs" area (this CR's own explore.md) went
+from 13 files read the first time to 1 the second.
+
+behaviour change: yes — `explore`'s findings file is now written
+incrementally rather than composed once at the end (an interrupted run now
+leaves a partial file where before it may have left nothing), and every
+agent-executed command's closing sequence gains a cost-report line it did
+not have before. No change to any command's output *format* (the findings
+file's four headings, the spec's four sections, the checkbox and archived:
+conventions are all unchanged) or to any `delta/bin/*` script.
+
 ## CR-006 — Information graphics (2026-08-29)
 
 A two-line lifecycle rail (`delta/bin/stage-rail`) opens every command,

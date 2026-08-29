@@ -106,6 +106,17 @@ afterward. This is composed response text, not a live-updating terminal
 line: there is no real spinner or running clock here the way `verify` has one,
 so don't imply one. One line per event, in order.
 
+## Say what this cost (CR-007)
+
+One line, directly above the closing frame:
+
+     read: 5 files · truth: not used
+
+Files opened to implement the spec — constitution, spec, explore.md, plus
+whatever source you had to read to make each change. `truth: not used`
+is the normal case here; `truth: used` only if you went back to `delta/truth/`
+for context the spec and explore.md did not already carry.
+
 ## Signature frame — print this last
 
 The final line of your response, after everything else:

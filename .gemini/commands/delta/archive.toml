@@ -134,6 +134,16 @@ One line per truth file touched, with what happened to it:
      updated  truth/payments.md      3 modified · 1 removed
      created  truth/webhooks.md      4 added
 
+## Say what this cost (CR-007)
+
+One line, directly above the closing frame:
+
+     read: 3 files · truth: used
+
+Files opened to fold the spec in — the spec, explore.md, and each truth file
+touched. `truth: used` here almost always, since folding into truth means
+reading the truth files being folded into.
+
 ## Signature frame — print this last
 
 The final line of your response, after everything else:
