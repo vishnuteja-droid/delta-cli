@@ -1,5 +1,7 @@
 # CR-DOCS — Reconcile docs with shipped behaviour (recurring)
 
+archived: 2026-08-29
+
 ## Context
 
 Six prior changes shipped (initial build, CR-001, CR-002, CR-002.R, CR-005,
