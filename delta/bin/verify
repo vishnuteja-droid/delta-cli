@@ -2,11 +2,19 @@
 # delta verify - run the checks bound to a change's acceptance criteria.
 #
 # Usage:  delta/bin/verify [--archive-gate] [change-id]
+#         delta/bin/verify --all
 #         DELTA_CHANGE=<id> delta/bin/verify
 #         DELTA_ROOT=<path> delta/bin/verify
 #
 # With no argument the most recently modified directory under delta/changes/
 # is used.
+#
+# --all (CR-006) is a read-only dashboard across every change: it never
+# executes a check, only reads what past runs already wrote to
+# run/*/results.tsv, and shows each criterion's last eight runs as a
+# duration/pass-fail sparkline. Exits 0 unless the repository itself could
+# not be resolved - it is a report, not a verdict, so it has no other exit
+# code to give.
 #
 # Root: by default this script resolves the repository root from its own
 # location (it lives at <root>/delta/bin/verify, wherever that is), which
@@ -62,6 +70,17 @@
 #
 # No model is involved in this script. A check is an executable file: it exits
 # 0 or it does not.
+#
+# Lifecycle rail and startup reveal (CR-006)
+#   The opening frame is followed by delta/bin/stage-rail's two-line output -
+#   see that script's own header for how each stage's state is computed.
+#   The frame itself draws with a brief (roughly 200ms) left-to-right reveal
+#   the first time this runs in a given terminal session (keyed by `tty`'s
+#   device path), then instantly on every command after that in the same
+#   session. Skipped entirely off a TTY, or if `tty`/`stty` are not usable.
+#   Interruptible by any keypress, via a non-blocking read against the
+#   controlling tty (`stty ... min 0 time 0` + the shell's own `read`
+#   builtin - no `read -t`, a bash-ism dash does not have).
 
 set -u
 
@@ -103,36 +122,42 @@ announce_root_if_needed() {
 }
 
 archive_gate=0
+all_mode=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --archive-gate) archive_gate=1; shift ;;
+        --all) all_mode=1; shift ;;
         --) shift; break ;;
         -*) die "unknown option: $1" ;;
         *) break ;;
     esac
 done
 
-change=${1:-${DELTA_CHANGE:-}}
-if [ -z "$change" ]; then
+if [ "$all_mode" -eq 1 ]; then
     [ -d "$CHANGES_DIR" ] || die "no delta/changes/ directory yet - run propose first"
-    change=$(ls -t "$CHANGES_DIR" 2>/dev/null | head -n 1)
-    [ -n "$change" ] || die "no changes under delta/changes/ - run propose first"
+else
+    change=${1:-${DELTA_CHANGE:-}}
+    if [ -z "$change" ]; then
+        [ -d "$CHANGES_DIR" ] || die "no delta/changes/ directory yet - run propose first"
+        change=$(ls -t "$CHANGES_DIR" 2>/dev/null | head -n 1)
+        [ -n "$change" ] || die "no changes under delta/changes/ - run propose first"
+    fi
+
+    # An argument containing a slash is treated as a path to a change directory;
+    # anything else is an id under delta/changes/.
+    change=${change%/}
+    case "$change" in
+        */*) CHANGE_DIR=$change ;;
+        *)   CHANGE_DIR="$CHANGES_DIR/$change" ;;
+    esac
+    label=${CHANGE_DIR##*/}
+    SPEC="$CHANGE_DIR/spec.md"
+    CHECKS_DIR="$CHANGE_DIR/checks"
+    SIGNOFF="$CHANGE_DIR/run/signoff.md"
+
+    [ -d "$CHANGE_DIR" ] || die "no such change: $change"
+    [ -f "$SPEC" ]       || die "no spec.md in $CHANGE_DIR"
 fi
-
-# An argument containing a slash is treated as a path to a change directory;
-# anything else is an id under delta/changes/.
-change=${change%/}
-case "$change" in
-    */*) CHANGE_DIR=$change ;;
-    *)   CHANGE_DIR="$CHANGES_DIR/$change" ;;
-esac
-label=${CHANGE_DIR##*/}
-SPEC="$CHANGE_DIR/spec.md"
-CHECKS_DIR="$CHANGE_DIR/checks"
-SIGNOFF="$CHANGE_DIR/run/signoff.md"
-
-[ -d "$CHANGE_DIR" ] || die "no such change: $change"
-[ -f "$SPEC" ]       || die "no spec.md in $CHANGE_DIR"
 
 # ---------------------------------------------------------- capabilities ----
 
@@ -222,7 +247,11 @@ fi
 # up before anything ever hides the cursor, and it must be unconditional:
 # even a no-colour run prints CURSOR_SHOW (which is empty in that case, so
 # the trap is always safe to fire).
+reveal_stty_saved=''
+reveal_tty_dev=''
 restore_terminal() {
+    [ -n "$reveal_stty_saved" ] && stty "$reveal_stty_saved" < "$reveal_tty_dev" 2>/dev/null
+    reveal_stty_saved=''
     printf '%s%s' "$CURSOR_SHOW" "$C_OFF"
 }
 
@@ -323,6 +352,115 @@ rule_line() {  # signature frame: two spaces, sigil, rule, right-hand label
     printf '  %s %s  %s\n' "${_linecolor}${SIG}${_linecolor:+$C_OFF}" "$_r" "$_label"
 }
 
+# reveal_opening_frame <label> - CR-006's startup moment: the first delta
+# command in a terminal session draws the opening frame with a brief
+# left-to-right reveal (roughly 200ms), instead of appearing all at once.
+# Once per terminal session (keyed by `tty`'s device path, so a second pane
+# gets its own reveal), skipped off a TTY or when `sleep`/`tty`/`stty`/`dd`
+# are not usable, and interruptible by any keypress - reads non-blocking
+# from the controlling tty via `stty ... min 0 time 0` + `dd bs=1 count=1`,
+# a POSIX-portable way to poll for input with no `read -t` (a bash-ism dash
+# does not have). Every other command after the first in the same session
+# prints the frame instantly, same as rule_line always has.
+reveal_opening_frame() {
+    _label=$1
+    _plain=$_label
+    _maxlabel=$((cols - 4 - 2 - 3))
+    [ "$_maxlabel" -lt 8 ] && _maxlabel=8
+    if [ ${#_plain} -gt "$_maxlabel" ]; then
+        _plain=$(trunc "$_plain" "$_maxlabel")
+        _label=$_plain
+    fi
+    _avail=$((cols - 4 - ${#_plain} - 2))
+    [ "$_avail" -lt 3 ] && _avail=3
+
+    _do_reveal=0
+    if [ "$is_tty" -eq 1 ] && [ "$spinner_ok" -eq 1 ] \
+        && command -v tty >/dev/null 2>&1 && command -v stty >/dev/null 2>&1 \
+        && command -v dd >/dev/null 2>&1; then
+        _ttypath=$(tty 2>/dev/null) || _ttypath=''
+        case "$_ttypath" in
+            /*)
+                _markerdir="${TMPDIR:-/tmp}/.delta-reveal-seen"
+                mkdir -p "$_markerdir" 2>/dev/null
+                _markerkey=$(printf '%s' "$_ttypath" | tr '/' '_')
+                _marker="$_markerdir/$_markerkey"
+                if [ ! -f "$_marker" ] && [ -w "$_markerdir" ]; then
+                    _do_reveal=1
+                    reveal_tty_dev=$_ttypath
+                fi
+                ;;
+        esac
+    fi
+
+    if [ "$_do_reveal" -eq 0 ]; then
+        rule_line "$_label" '' "$_plain"
+        return 0
+    fi
+
+    printf '%s' "$CURSOR_HIDE"
+    reveal_stty_saved=$(stty -g < "$reveal_tty_dev" 2>/dev/null) || reveal_stty_saved=''
+    if [ -n "$reveal_stty_saved" ]; then
+        stty -icanon -echo min 0 time 0 < "$reveal_tty_dev" 2>/dev/null
+        # Open once, poll many times from the same fd: reopening the device
+        # path fresh on every poll (or shelling out to `dd`/anything external)
+        # costs a fork+exec per poll, which on a loaded machine can outrun the
+        # whole reveal's own 200ms budget. The shell's own `read` builtin
+        # against an already-non-canonical fd needs neither.
+        exec 3< "$reveal_tty_dev" 2>/dev/null || reveal_stty_saved=''
+    fi
+
+    if [ "$use_truecolor" -eq 1 ]; then
+        set -- $PALETTE_RGB_ACCENT;  _ar=$1; _ag=$2; _ab=$3
+        set -- $PALETTE_RGB_FG_DIM;  _dr=$1; _dg=$2; _db=$3
+    fi
+
+    _steps=8
+    _interrupted=0
+    _s=1
+    while [ "$_s" -le "$_steps" ]; do
+        if [ -n "$reveal_stty_saved" ] && IFS= read -r _key <&3; then
+            _interrupted=1
+        fi
+        [ "$_interrupted" -eq 1 ] && _s=$_steps
+
+        _shown=$(( _avail * _s / _steps ))
+        [ "$_shown" -gt "$_avail" ] && _shown=$_avail
+        _r=''; _i=0
+        while [ "$_i" -lt "$_shown" ]; do
+            if [ "$use_truecolor" -eq 1 ]; then
+                if [ "$_avail" -gt 1 ]; then
+                    _gr=$(( _ar + (_dr - _ar) * _i / (_avail - 1) ))
+                    _gg=$(( _ag + (_dg - _ag) * _i / (_avail - 1) ))
+                    _gb=$(( _ab + (_db - _ab) * _i / (_avail - 1) ))
+                else
+                    _gr=$_ar; _gg=$_ag; _gb=$_ab
+                fi
+                _r="$_r$(printf '\033[38;2;%s;%s;%sm%s' "$_gr" "$_gg" "$_gb" "$RULE")"
+            else
+                _r="$_r$RULE"
+            fi
+            _i=$((_i + 1))
+        done
+        [ "$use_truecolor" -eq 1 ] && _r="$_r$C_OFF"
+        if [ "$_shown" -eq "$_avail" ]; then
+            printf '\r  %s %s  %s' "$SIG" "$_r" "$_label"
+        else
+            printf '\r  %s %s' "$SIG" "$_r"
+        fi
+        [ "$_s" -lt "$_steps" ] && sleep 0.02
+        _s=$((_s + 1))
+    done
+    printf '\n'
+
+    if [ -n "$reveal_stty_saved" ]; then
+        stty "$reveal_stty_saved" < "$reveal_tty_dev" 2>/dev/null
+        reveal_stty_saved=''
+        exec 3<&- 2>/dev/null
+    fi
+    mkdir -p "$_markerdir" 2>/dev/null && : > "$_marker" 2>/dev/null
+}
+
 now_ms() {
     _n=$(date +%s%N 2>/dev/null)
     case "$_n" in
@@ -344,6 +482,151 @@ spin_frame() {
     done
 }
 
+# -------------------------------------------------------------- all mode ----
+# CR-006: verify --all is a read-only dashboard across every change under
+# delta/changes/ - it never executes a check, it only reads what past runs
+# already wrote to run/*/results.tsv. Each criterion with check-execution
+# history gets an eight-slot sparkline: bar height is that criterion's own
+# relative duration across the shown history, colour is pass/fail per the
+# shared palette - "went from failing to passing" is a colour change,
+# "started getting slower" is the bars climbing. A criterion never run yet
+# gets no sparkline; there is nothing to chart.
+
+if [ "$all_mode" -eq 1 ]; then
+    if [ "$unicode" -eq 1 ]; then
+        SPARK_LEVELS=$PALETTE_SPARK_UTF8
+    else
+        SPARK_LEVELS=$PALETTE_SPARK_ASCII
+    fi
+    SPARK_N=0
+    for _sl in $SPARK_LEVELS; do SPARK_N=$((SPARK_N + 1)); done
+
+    spark_char() {  # $1 level 0..SPARK_N-1
+        _n=$1; _i=0
+        for _sl in $SPARK_LEVELS; do
+            [ "$_i" -eq "$_n" ] && { printf '%s' "$_sl"; return; }
+            _i=$((_i + 1))
+        done
+    }
+
+    # parse_criteria_of <spec-file> - same grammar delta/bin/verify's own
+    # single-change mode parses, factored out so both paths can never disagree.
+    parse_criteria_of() {
+        awk '
+            /^##+[ \t]*[Aa]cceptance [Cc]riteria/ { inblock = 1; next }
+            /^##/                                 { inblock = 0 }
+            inblock && /^[ \t]*-[ \t]+[A-Z]+[0-9]+[ \t]/ {
+                sub(/^[ \t]*-[ \t]+/, "")
+                id = $1
+                sub(/^[A-Z]+[0-9]+[ \t]+/, "")
+                kind = "AUTO"
+                if ($0 ~ /^MANUAL([ \t]|$)/) { kind = "MANUAL"; sub(/^MANUAL[ \t]*/, "") }
+                gsub(/[ \t]+$/, "")
+                printf "%s\t%s\t%s\n", id, kind, $0
+            }
+        ' "$1"
+    }
+
+    # Column geometry, independent of single-change mode's - --all spans
+    # many changes, so it uses its own fixed, generous id width.
+    dash_idw=3
+    dash_descw=$((cols - 2 - GLYPH_W - 1 - dash_idw - 2 - 12))
+    [ "$dash_descw" -lt 12 ] && dash_descw=12
+
+    dash_emit() {  # $1 glyph, $2 colour, $3 id, $4 desc, $5 right-hand text
+        printf '  %s %s %s %s\n' \
+            "$2$(pad "$1" "$GLYPH_W")$C_OFF" \
+            "$(pad "$3" "$dash_idw")" \
+            "$(pad "$(trunc "$4" "$dash_descw")" "$dash_descw")" \
+            "$5"
+    }
+
+    any_change=0
+    for cdir in "$CHANGES_DIR"/*/; do
+        [ -d "$cdir" ] || continue
+        cspec="${cdir}spec.md"
+        [ -f "$cspec" ] || continue
+        crit=$(parse_criteria_of "$cspec")
+        [ -n "$crit" ] || continue
+        any_change=1
+        clabel=${cdir%/}; clabel=${clabel##*/}
+
+        printf '\n  %s%s%s\n' "$C_DIM" "$clabel" "$C_OFF"
+
+        crit_tmp=$(mktemp)
+        printf '%s\n' "$crit" > "$crit_tmp"
+        while IFS="$TAB" read -r cid ckind cdesc; do
+            [ -n "$cid" ] || continue
+            if [ "$ckind" = MANUAL ]; then
+                dash_emit "$G_MAN" "$C_DIM" "$cid" "$cdesc" "manual"
+                continue
+            fi
+
+            # Newest-8 history for this criterion, oldest of the eight first -
+            # run directory names are UTC timestamps, so a plain sort is
+            # chronological.
+            hist_tmp=$(mktemp)
+            for rdir in "$cdir"run/*/; do
+                [ -f "${rdir}results.tsv" ] || continue
+                awk -F"$TAB" -v id="$cid" 'NR>1 && $1==id {print $2 "\t" $5}' "${rdir}results.tsv"
+            done | sort | tail -n 8 > "$hist_tmp"
+
+            if [ ! -s "$hist_tmp" ]; then
+                dash_emit "$G_PEND" "$C_DIM" "$cid" "$cdesc" "no runs yet"
+                rm -f "$hist_tmp"
+                continue
+            fi
+
+            dmin=''; dmax=''
+            while IFS="$TAB" read -r _hs hd; do
+                case "$hd" in ''|*[!0-9]*) continue ;; esac
+                [ -z "$dmin" ] && dmin=$hd && dmax=$hd
+                [ "$hd" -lt "$dmin" ] && dmin=$hd
+                [ "$hd" -gt "$dmax" ] && dmax=$hd
+            done < "$hist_tmp"
+            [ -z "$dmin" ] && dmin=0
+            [ -z "$dmax" ] && dmax=0
+
+            if [ "$unicode" -eq 1 ]; then
+                spark=''; last_dur=0
+                while IFS="$TAB" read -r hstatus hdur; do
+                    [ -n "$hstatus" ] || continue
+                    case "$hstatus" in
+                        passed|fixed) hc=$C_PASS ;;
+                        reproduced)   hc='' ;;
+                        *)            hc=$C_FAIL ;;
+                    esac
+                    case "$hdur" in ''|*[!0-9]*) hdur=0 ;; esac
+                    if [ "$dmax" -gt "$dmin" ]; then
+                        lvl=$(( (hdur - dmin) * (SPARK_N - 1) / (dmax - dmin) ))
+                    else
+                        lvl=$((SPARK_N / 2))
+                    fi
+                    spark="${spark}${hc}$(spark_char "$lvl")${C_OFF}"
+                    last_dur=$hdur
+                done < "$hist_tmp"
+                dash_emit "$G_PASS" "$C_PASS" "$cid" "$cdesc" "$spark  $(fmt_dur "$last_dur")"
+            else
+                total=0; ok=0; sumdur=0
+                while IFS="$TAB" read -r hstatus hdur; do
+                    [ -n "$hstatus" ] || continue
+                    total=$((total + 1))
+                    case "$hstatus" in passed|fixed) ok=$((ok + 1)) ;; esac
+                    case "$hdur" in ''|*[!0-9]*) hdur=0 ;; esac
+                    sumdur=$((sumdur + hdur))
+                done < "$hist_tmp"
+                [ "$total" -gt 0 ] && avg=$((sumdur / total)) || avg=0
+                dash_emit "$G_PASS" "$C_PASS" "$cid" "$cdesc" "$ok/$total $(fmt_dur "$avg") avg"
+            fi
+            rm -f "$hist_tmp"
+        done < "$crit_tmp"
+        rm -f "$crit_tmp"
+    done
+    [ "$any_change" -eq 1 ] || printf '\n  %sno changes with acceptance criteria yet%s\n' "$C_DIM" "$C_OFF"
+    printf '\n'
+    exit 0
+fi
+
 # --------------------------------------------------------------- parsing ----
 
 # Criteria live under an "## Acceptance criteria" heading in spec.md, one per
@@ -364,6 +647,18 @@ CRITERIA=$(awk '
 ' "$SPEC")
 
 [ -n "$CRITERIA" ] || die "no acceptance criteria found in $SPEC (expected a '## Acceptance criteria' section with '- C1 ...' lines; ids are an uppercase prefix and a number, so B1 works too)"
+
+# The frame and rail print here, before this run's own run/<timestamp>/
+# directory is created below - stage-rail reads run/ history to compute
+# verify's own position, and a run directory that exists but has not
+# finished yet (just its header line written) would otherwise read as an
+# empty, all-passed run and show the wrong state for the very run in progress.
+announce_root_if_needed
+
+reveal_opening_frame "delta verify $SEP $label"
+printf '\n'
+[ -x "$script_dir/stage-rail" ] && "$script_dir/stage-rail" verify "$CHANGE_DIR"
+printf '\n'
 
 # The reproduction ledger is tracked in git alongside signoff.md, unlike the
 # per-run directories. It has to survive a fresh clone: it is what distinguishes
@@ -478,11 +773,6 @@ FAILLOG="$RUN_DIR/.failures"
 WARNLOG="$RUN_DIR/.warnings"
 : > "$FAILLOG"
 : > "$WARNLOG"
-
-announce_root_if_needed
-
-rule_line "delta verify $SEP $label"
-printf '\n'
 
 run_started=$(now_ms)
 

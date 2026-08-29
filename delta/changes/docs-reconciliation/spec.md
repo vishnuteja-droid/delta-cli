@@ -67,7 +67,8 @@ None.
 - C7 CHANGELOG.md has one entry for every shipped change in `git log`
       between the initial `Add delta` commit and this change, each with a
       `behaviour change:` line
-- C8 CHANGELOG.md's reconciliation log ends with a dated entry for this run
+- C8 CHANGELOG.md's reconciliation log has a dated entry, and reconciliation
+      is not more than 4 shipped changes overdue (this CR's own cadence)
 - C9 MANUAL every command shown as a literal, runnable example in README.md,
       AGENTS.md, and delta/commands/*.md was actually executed this run, not
       eyeballed

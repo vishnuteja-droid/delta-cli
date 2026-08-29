@@ -9,6 +9,31 @@ file). Every other entry documents delta itself; `CR-DOCS` entries document
 a documentation pass, not a code change, so they carry no behaviour-change
 line.
 
+## CR-006 — Information graphics (2026-08-29)
+
+A two-line lifecycle rail (`delta/bin/stage-rail`) opens every command,
+showing each of the five stages as pending/in-progress/done, with a failed
+stage staying red until resolved. `explore` draws the call chain as a
+unicode box-drawing diagram with unknowns marked inline, plus an
+unconditional Mermaid export (`delta/changes/<id>/flow.mmd`). `verify --all`
+is a new read-only dashboard: every criterion's last eight runs as a
+duration/pass-fail sparkline, no checks executed. `delta/bin/report`'s
+fourth question gains a per-change failure heatmap (checks × runs). `verify`
+draws a brief, interruptible, once-per-terminal-session startup reveal.
+While building the rail, also fixed a real bug in `delta/bin/verify`
+(shipped in CR-004): the run directory for the current invocation was
+created before the opening frame printed, so a command reading "the last
+run" — exactly what the rail does — misread its own in-progress run as a
+completed, all-passed one. Also removed a debug `echo` left in the
+signal handler by the CR-004 session, which wrote to a hardcoded
+sandbox-only scratchpad path on every real Ctrl-C.
+
+behaviour change: yes — `delta/bin/verify`'s opening frame now prints
+before its own `run/<timestamp>/` directory is created, not after (visible
+only to something reading `run/` mid-execution, which nothing shipped does).
+No — everything else here is additive: the rail, sparklines, heatmap, flow
+diagrams, and reveal are all new surfaces with no prior behaviour to change.
+
 ## CR-004 — Presence, in the terminal and the UI (2026-08-28)
 
 `delta/bin/verify` gets a live status line while a check runs, a truecolor

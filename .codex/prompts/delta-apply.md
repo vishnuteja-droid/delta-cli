@@ -21,6 +21,21 @@ The very last line is the closing frame, described at the bottom of this file.
 A closing frame is how the reader knows you ran this command to completion
 instead of drifting off part-way, so it is not optional and not decorative.
 
+## Lifecycle rail — print this next (CR-006)
+
+Immediately after the opening frame, run this literally and print its output
+verbatim, then a blank line — do not describe the rail, do not recompute it
+yourself, and do not skip it because you already know the answer:
+
+```sh
+delta/bin/stage-rail apply $ARGUMENTS
+```
+
+If `delta/bin/stage-rail` does not exist (a repo whose `delta/bin/verify` was
+copied in before CR-006), it has not shipped there yet — skip this section
+silently rather than fabricating a rail. If no change exists yet, the script
+prints nothing; print nothing yourself either.
+
 ## Where this repository's delta/ lives
 
 Resolve the root the way git resolves its own, before doing anything else:

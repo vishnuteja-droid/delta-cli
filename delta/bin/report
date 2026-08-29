@@ -483,6 +483,74 @@ else
     done < "$TMP/criterion_repro_counts.tsv"
     printf '</table>\n'
 fi
+
+# ---- CR-006: failure heatmap, one per change with at least two runs ----
+# A list already names which criteria failed more than once; it cannot show
+# the difference between a horizontal band (one criterion, persistently
+# broken), a vertical band (one run, a bad environment), and scattered cells
+# (flaky) - three different problems a count cannot distinguish. Checks
+# down the side, runs across the top, oldest run first.
+printf '<p class="note" style="margin-top:1.1rem">Checks (rows) across runs (columns), oldest run first — a horizontal band is a\n'
+printf 'persistently broken criterion, a vertical band is a bad run, scattered cells are flaky:</p>\n'
+any_heatmap=0
+for hm_ch in $(cut -f1 "$TMP/changes.tsv"); do
+    hm_nruns=$(awk -F'\t' -v c="$hm_ch" '$1==c' "$TMP/runs.tsv" | wc -l | tr -d ' ')
+    [ "$hm_nruns" -ge 2 ] || continue
+
+    awk -F'\t' -v c="$hm_ch" '$1==c{print $2}' "$TMP/runs.tsv" | sort -u > "$TMP/hm_runs.txt"
+    awk -F'\t' -v c="$hm_ch" '$1==c{print $3}' "$TMP/flat.sorted.tsv" | awk '!seen[$0]++' \
+        | awk '{ match($0, /[0-9]+$/); pre=substr($0,1,RSTART-1); num=substr($0,RSTART)+0
+                 printf "%s\t%010d\t%s\n", pre, num, $0 }' \
+        | sort -t'	' -k1,1 -k2,2 | cut -f3 > "$TMP/hm_crit.txt"
+    awk -F'\t' -v c="$hm_ch" '$1==c' "$TMP/flat.sorted.tsv" > "$TMP/hm_flat.tsv"
+
+    n_r=$(wc -l < "$TMP/hm_runs.txt" | tr -d ' ')
+    n_c=$(wc -l < "$TMP/hm_crit.txt" | tr -d ' ')
+    [ "$n_c" -gt 0 ] && [ "$n_r" -gt 0 ] || continue
+    any_heatmap=1
+
+    cellw=13; cellh=13; gap=2; labelw=150
+    svgw=$((labelw + n_r * (cellw + gap) + 6))
+    svgh=$((n_c * (cellh + gap) + 6))
+
+    printf '<p class="legend" style="margin:0.8rem 0 0.2rem">%s</p>\n' "$(esc "$hm_ch")"
+    printf '<svg viewBox="0 0 %s %s" width="100%%" height="%s" role="img" aria-label="failure heatmap for %s">\n' \
+        "$svgw" "$svgh" "$svgh" "$(esc "$hm_ch")"
+    awk -F'\t' -v OFS='\t' \
+        -v labelw="$labelw" -v cellw="$cellw" -v cellh="$cellh" -v gap="$gap" \
+        -v pass="$PASS" -v fail="$FAIL" -v accent="$ACCENT" -v fgdim="$FG_DIM" -v fg="$FG" -v rule="$RULE" '
+        FNR == 1 { fileno++ }
+        fileno == 1 { run_idx[$1] = FNR - 1; next }               # hm_runs.txt
+        fileno == 2 {                                              # hm_crit.txt
+            crit_idx[$1] = FNR - 1
+            label = $1
+            if (length(label) > 20) label = substr(label, 1, 19) "\xe2\x80\xa6"
+            y = (FNR - 1) * (cellh + gap)
+            printf "  <text x=\"0\" y=\"%d\" fill=\"%s\" font-size=\"10\">%s</text>\n", y + cellh - 2, fgdim, label
+            next
+        }
+        fileno == 3 {                                               # hm_flat.tsv
+            crit = $3; status = $4; rts = $2
+            if (!(crit in crit_idx) || !(rts in run_idx)) next
+            cx = labelw + run_idx[rts] * (cellw + gap)
+            cy = crit_idx[crit] * (cellh + gap)
+            if (status == "passed" || status == "fixed")            col = pass
+            else if (status == "failed" || status == "suspicious")  col = fail
+            else if (status == "error" || status == "no-check")     col = accent
+            else if (status == "manual-open" || status == "manual-signed") col = fgdim
+            else if (status == "reproduced")                        col = fg
+            else                                                    col = rule
+            printf "  <rect x=\"%d\" y=\"%d\" width=\"%d\" height=\"%d\" rx=\"1\" fill=\"%s\"><title>%s %s: %s</title></rect>\n", \
+                cx, cy, cellw, cellh, col, crit, rts, status
+        }
+    ' "$TMP/hm_runs.txt" "$TMP/hm_crit.txt" "$TMP/hm_flat.tsv"
+    printf '</svg>\n'
+done
+if [ "$any_heatmap" -eq 0 ]; then
+    printf '<p class="note">No change has two or more runs yet — a heatmap needs at least two columns to show a pattern.</p>\n'
+else
+    printf '<p class="legend"><span class="sw" style="background:var(--pass)"></span>passed<span class="sw" style="background:var(--fail)"></span>failed<span class="sw" style="background:var(--accent)"></span>could not run<span class="sw manual"></span>manual</p>\n'
+fi
 printf '</div>\n'
 } >> "$OUT"
 

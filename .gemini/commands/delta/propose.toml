@@ -154,6 +154,18 @@ acceptance criterion into `delta/changes/<id>/checks/`.
 
 Use the existing change directory if `explore` already made one for this area.
 
+### Lifecycle rail — print this next (CR-006)
+
+As soon as `<id>` is known, run this literally and print its output verbatim,
+then a blank line — before writing anything:
+
+```sh
+delta/bin/stage-rail propose <id>
+```
+
+If `delta/bin/stage-rail` does not exist, or there is no `delta/` yet at this
+point in the lazy-init flow above, skip this section silently.
+
 ## Read first, in this order
 
 1. `delta/constitution.md` — inherited by every change. Its rules constrain

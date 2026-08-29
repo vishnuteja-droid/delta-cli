@@ -1,0 +1,162 @@
+#!/bin/sh
+# delta stage-rail - the two-line lifecycle position indicator every command
+# opens with (CR-006). Real, committed, the single source of the stage
+# logic: delta/bin/verify calls this directly for its own real output, and
+# the four agent-executed commands (explore/propose/apply/archive) run it
+# literally too - see the "Lifecycle rail" section in each of their prompt
+# files - so the rail can never say something different depending on which
+# command drew it.
+#
+# Usage: delta/bin/stage-rail <current-stage> [change-id]
+#   <current-stage> - one of explore propose apply verify archive; the
+#                      current one is drawn in the accent colour.
+#   [change-id]      - defaults to the most recently modified change under
+#                       delta/changes/, same rule as delta/bin/verify. If no
+#                       change exists yet, prints nothing and exits 0 - there
+#                       is no position to show before the first change.
+#
+# Stage state, per stage:
+#   explore  done if <id>/explore.md exists, else pending. Never fails.
+#   propose  done if spec.md has an "## Acceptance criteria" section with at
+#            least one criterion, else pending. Never fails on its own.
+#   apply    read from the checkbox marks apply.md's own instructions make
+#            (- [x] done, - [!] blocked) in the ADDED/MODIFIED/REMOVED/RENAMED
+#            sections above "## Acceptance criteria". None marked at all -
+#            a spec nobody has run apply's checkbox convention on - falls
+#            back to: any run/ history at all means apply must have already
+#            happened before that run could have passed anything.
+#   verify   done if the most recent run/<timestamp>/results.tsv has no
+#            failed/no-check/suspicious/error rows; failed if it does;
+#            pending if verify has never run.
+#   archive  done if spec.md has an "archived:" header, else pending.
+#
+# A stage marked failed stays red regardless of which stage is "current" -
+# that is the point: a change stuck at verify should look stuck every time
+# any command in it is touched, not just when verify itself runs.
+set -u
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
+. "$script_dir/palette.sh"
+
+current=${1:-}
+case "$current" in
+    explore|propose|apply|verify|archive) ;;
+    *) printf 'stage-rail: usage: stage-rail <explore|propose|apply|verify|archive> [change-id]\n' >&2
+       exit 1 ;;
+esac
+
+if [ -n "${DELTA_ROOT-}" ]; then
+    ROOT=$DELTA_ROOT
+else
+    ROOT=$(dirname -- "$(dirname -- "$script_dir")")
+fi
+CHANGES_DIR="$ROOT/delta/changes"
+
+change=${2:-}
+if [ -z "$change" ]; then
+    [ -d "$CHANGES_DIR" ] && change=$(ls -t "$CHANGES_DIR" 2>/dev/null | head -n 1)
+fi
+[ -n "$change" ] || exit 0
+case "$change" in
+    */*) CHANGE_DIR=$change ;;
+    *)   CHANGE_DIR="$CHANGES_DIR/$change" ;;
+esac
+[ -d "$CHANGE_DIR" ] || exit 0
+SPEC="$CHANGE_DIR/spec.md"
+
+# ---------------------------------------------------------- capabilities ----
+is_tty=0
+[ -t 1 ] && is_tty=1
+use_color=$is_tty
+[ -n "${NO_COLOR-}" ] && use_color=0
+loc="${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"
+case "$loc" in
+    *UTF-8*|*utf-8*|*UTF8*|*utf8*) unicode=1 ;;
+    *)                             unicode=0 ;;
+esac
+
+if [ "$unicode" -eq 1 ]; then
+    DOT_FULL=$PALETTE_STAGE_FULL_UTF8; DOT_HALF=$PALETTE_STAGE_HALF_UTF8
+    DOT_HOLLOW=$PALETTE_STAGE_HOLLOW_UTF8; CONN=$PALETTE_RAIL_CONN_UTF8
+else
+    DOT_FULL=$PALETTE_STAGE_FULL_ASCII; DOT_HALF=$PALETTE_STAGE_HALF_ASCII
+    DOT_HOLLOW=$PALETTE_STAGE_HOLLOW_ASCII; CONN=$PALETTE_RAIL_CONN_ASCII
+fi
+
+if [ "$use_color" -eq 1 ]; then
+    C_ACCENT=$(printf '\033[%sm' "$PALETTE_ANSI_ACCENT")
+    C_DIM=$(printf '\033[%sm' "$PALETTE_ANSI_DIM")
+    C_FAIL=$(printf '\033[%sm' "$PALETTE_ANSI_FAIL")
+    C_OFF=$(printf '\033[0m')
+else
+    C_ACCENT=''; C_DIM=''; C_FAIL=''; C_OFF=''
+fi
+
+# --------------------------------------------------------------- states -----
+
+if [ -f "$CHANGE_DIR/explore.md" ]; then explore_state=done; else explore_state=pending; fi
+
+if [ -f "$SPEC" ] && grep -qE '^##+[ \t]*[Aa]cceptance [Cc]riteria' "$SPEC" 2>/dev/null; then
+    propose_state=done
+else
+    propose_state=pending
+fi
+
+apply_state=pending
+if [ "$propose_state" = done ]; then
+    body=$(awk '/^##+[ \t]*[Aa]cceptance [Cc]riteria/{exit} {print}' "$SPEC")
+    total_items=$(printf '%s\n' "$body" | grep -cE '^[ \t]*-[ \t]+(\[[ xX!]\][ \t]+)?[^ \t]') || total_items=0
+    checked_items=$(printf '%s\n' "$body" | grep -cE '^[ \t]*-[ \t]+\[[xX]\][ \t]') || checked_items=0
+    if printf '%s\n' "$body" | grep -qE '^[ \t]*-[ \t]+\[!\][ \t]'; then
+        apply_state=failed
+    elif [ "$total_items" -gt 0 ] && [ "$checked_items" -eq "$total_items" ]; then
+        apply_state=done
+    elif [ "$checked_items" -gt 0 ]; then
+        apply_state=in-progress
+    elif [ -d "$CHANGE_DIR/run" ] && [ -n "$(ls -d "$CHANGE_DIR"/run/*/ 2>/dev/null)" ]; then
+        apply_state=done
+    fi
+fi
+
+verify_state=pending
+if [ -d "$CHANGE_DIR/run" ]; then
+    last_run=$(ls -td "$CHANGE_DIR"/run/*/ 2>/dev/null | head -n 1)
+    if [ -n "$last_run" ] && [ -f "${last_run}results.tsv" ]; then
+        bad=$(awk -F'\t' 'NR>1 && ($2=="failed"||$2=="no-check"||$2=="suspicious"||$2=="error"){c++} END{print c+0}' \
+            "${last_run}results.tsv")
+        if [ "$bad" -gt 0 ]; then verify_state=failed; else verify_state=done; fi
+    fi
+fi
+
+if grep -qE '^archived:' "$SPEC" 2>/dev/null; then archive_state=done; else archive_state=pending; fi
+
+# -------------------------------------------------------------- render ------
+
+dot_for() {  # $1 state, $2 stage-name
+    _st=$1
+    case "$_st" in
+        done|failed) _g=$DOT_FULL ;;
+        in-progress) _g=$DOT_HALF ;;
+        *)           _g=$DOT_HOLLOW ;;
+    esac
+    if [ "$_st" = failed ]; then
+        _c=$C_FAIL
+    elif [ "$2" = "$current" ]; then
+        _c=$C_ACCENT
+    else
+        _c=$C_DIM
+    fi
+    printf '%s%s%s' "$_c" "$_g" "$C_OFF"
+}
+
+conn=''
+_i=0
+while [ "$_i" -lt 6 ]; do conn="$conn$CONN"; _i=$((_i + 1)); done
+
+printf '    %s%s%s%s%s%s%s%s%s\n' \
+    "$(dot_for "$explore_state" explore)" "$conn" \
+    "$(dot_for "$propose_state" propose)" "$conn" \
+    "$(dot_for "$apply_state" apply)" "$conn" \
+    "$(dot_for "$verify_state" verify)" "$conn" \
+    "$(dot_for "$archive_state" archive)"
+printf '    explore propose  apply verify archive\n'

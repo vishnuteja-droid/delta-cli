@@ -52,6 +52,20 @@ nothing to write into: print the same findings to the terminal in full and
 stop there. Do not create `delta/` to make a place to put them — that is
 `propose`'s decision to make, not this command's.
 
+### Lifecycle rail — print this next (CR-006)
+
+As soon as `<id>` is known (an existing change directory, or the slug this
+run will create), run this literally and print its output verbatim, then a
+blank line — before writing anything, so it reflects state as of the start
+of this run:
+
+```sh
+delta/bin/stage-rail explore <id>
+```
+
+If `delta/bin/stage-rail` does not exist, or `delta/` itself does not exist
+yet (nothing to derive `<id>` from), skip this section silently.
+
 This is the step that makes the following `propose` worth trusting. A findings
 file that restates what the code obviously says has failed, even if everything
 in it is true.
@@ -70,10 +84,64 @@ existing is a normal, common state for a repository that has never run
    handlers, message consumers, scheduled jobs, CLI subcommands. Name the
    symbol and the file.
 2. **Call chain.** What calls what, in order, down to the thing that touches
-   state. Compress it to one line per hop.
+   state. Draw it — see "Draw the call chain" below.
 3. **Data touched.** Tables, collections, queues, caches, external services.
    For each, whether this area reads it, writes it, or both.
 4. **Unknowns.** What you could not determine from the code, stated plainly.
+
+## Draw the call chain (CR-006)
+
+A diagram replaces "one line per hop" above. Boxes for data, arrows for
+calls, unknowns marked inline where they occur — not listed separately at
+the bottom, which is where they get skimmed past:
+
+```
+    web ─┬─► eapi/orders ──► papi/dispatch ──► sapi/ledger ──► [ledger_entry]
+         └─► eapi/status ──► papi/query    ──► [payment]
+                                                  ▲
+                                            ? retry count from config
+```
+
+`►` (U+25BA) for a call, `─┬─`/`─└─` (U+2500, U+252C, U+2514) to branch,
+`[brackets]` for a data store, `▲` (U+25B2) plus a `?`-prefixed line under
+the node it questions for an unknown you cannot resolve there. Same
+characters every time — this is not decorative, a reader has to be able to
+learn the notation once.
+
+**Width rule:** if the widest row would exceed 80 columns, do not draw
+boxes — write the prose chain instead (`eapi/orders → papi/dispatch →
+sapi/ledger → [ledger_entry]`, one line per branch, unknowns as a trailing
+`(? retry count from config)`). Same rule if the terminal is not UTF-8 (see
+the signature frame section above for how you already know that): box-drawing
+without real box-drawing characters is worse than prose. A response is
+either the diagram or the prose chain, never both.
+
+**Also write a Mermaid version**, unconditionally, to
+`delta/changes/<id>/flow.mmd` — GitLab renders Mermaid natively in markdown,
+so this is documentation someone can browse with no terminal, and it diffs
+in a merge request the way a rendered image never would:
+
+```
+flowchart LR
+    web --> eapiOrders["eapi/orders"]
+    eapiOrders --> papiDispatch["papi/dispatch"]
+    papiDispatch --> sapiLedger["sapi/ledger"]
+    sapiLedger --> ledgerEntry[("ledger_entry")]
+    web --> eapiStatus["eapi/status"]
+    eapiStatus --> papiQuery["papi/query"]
+    papiQuery --> payment[("payment")]
+    papiQuery -.->|"? retry count from config"| papiQuery
+```
+
+`flowchart LR`, one node per hop, `[("...")]` for a data store, a
+self-loop dotted edge labelled `"? ..."` for an unknown attached to that
+node — the closest Mermaid gets to "inline", since it has no native
+annotation syntax. Write this file even when the terminal diagram fell back
+to prose: the Mermaid file has no width limit to fall back from.
+
+If the area has no meaningful chain (a single function, a pure data
+transform), skip both the diagram and the `.mmd` file and say so in one
+line — an empty diagram is worse than none.
 
 ## Unknowns are the point
 

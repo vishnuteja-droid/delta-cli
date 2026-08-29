@@ -69,6 +69,18 @@ PALETTE_ELLIPSIS_UTF8='…'; PALETTE_ELLIPSIS_ASCII='~'
 PALETTE_SPIN_UTF8='⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏'
 PALETTE_SPIN_ASCII='- \ | /'
 
+# CR-006 - the lifecycle rail (delta/bin/stage-rail) and sparklines
+# (delta/bin/verify --all). Same unicode-first/ASCII-fallback rule as
+# everything above.
+PALETTE_STAGE_FULL_UTF8='●';   PALETTE_STAGE_FULL_ASCII='#'
+PALETTE_STAGE_HALF_UTF8='◐';   PALETTE_STAGE_HALF_ASCII='+'
+PALETTE_STAGE_HOLLOW_UTF8='○'; PALETTE_STAGE_HOLLOW_ASCII='.'
+PALETTE_RAIL_CONN_UTF8='━';    PALETTE_RAIL_CONN_ASCII='='
+
+# Eight levels, lowest to highest - one per history slot in a sparkline.
+PALETTE_SPARK_UTF8='▁ ▂ ▃ ▄ ▅ ▆ ▇ █'
+PALETTE_SPARK_ASCII='1 2 3 4 5 6 7 8'
+
 # ------------------------------------------------------------ helpers -----
 
 # palette_hex <RGB triple, e.g. "$PALETTE_RGB_ACCENT"> -> "#rrggbb"
