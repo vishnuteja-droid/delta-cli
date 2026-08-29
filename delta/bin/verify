@@ -234,7 +234,6 @@ restore_terminal() {
 # check is still writing to the log underneath it.
 cpid=''
 on_signal() {
-    echo "on_signal fired at $(date +%s.%N)" >> /tmp/claude-0/-home-user-delta-cli/5d28aa46-dea9-5137-bfb0-4ea5bbf6a1e4/scratchpad/trapdebug.log
     [ -n "$cpid" ] && kill "$cpid" 2>/dev/null
     restore_terminal
 }
